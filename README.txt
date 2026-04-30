@@ -6,7 +6,7 @@
 3. "체크한 항목 삭제" 버튼을 누릅니다.
 
 파일 역할:
-- Run Codex Chat Cleaner.bat: 더블클릭 실행용 파일입니다.
+- Run Codex Chat Cleaner.bat: 더블클릭 실행용 파일입니다. 가능하면 CMD 창 없이 실행합니다.
 - codex_chat_cleaner.py: 실제 프로그램 본체입니다. 삭제하면 안 됩니다.
 - README.txt: 이 설명 파일입니다.
 
