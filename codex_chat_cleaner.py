@@ -149,7 +149,18 @@ def first_existing_workspace(row: ThreadRow) -> Path | None:
 
 
 def is_internal_review(row: ThreadRow) -> bool:
-    return row.title.startswith(INTERNAL_REVIEW_PREFIX)
+    if row.title.startswith(INTERNAL_REVIEW_PREFIX):
+        return True
+    if row.first_user_message.startswith(INTERNAL_REVIEW_PREFIX):
+        return True
+    try:
+        source = json.loads(row.source)
+    except json.JSONDecodeError:
+        return '"guardian"' in row.source.lower()
+    if not isinstance(source, dict):
+        return False
+    subagent = source.get("subagent")
+    return isinstance(subagent, dict) and subagent.get("other") == "guardian"
 
 
 def is_related_internal_review(row: ThreadRow, target_ids: set[str]) -> bool:
