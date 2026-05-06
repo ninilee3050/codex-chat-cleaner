@@ -20,6 +20,8 @@ SESSION_INDEX = CODEX_HOME / "session_index.jsonl"
 GLOBAL_STATE = CODEX_HOME / ".codex-global-state.json"
 INTERNAL_REVIEW_PREFIX = "The following is the Codex agent history"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+IMAGE_MIN_COLUMNS = 4
+IMAGE_CARD_MIN_WIDTH = 220
 
 COLORS = {
     "bg": "#171717",
@@ -380,6 +382,7 @@ class App(tk.Tk):
         self.thumbnail_refs: list[tk.PhotoImage] = []
         self.search_text = tk.StringVar(value="")
         self.view_mode = "sessions"
+        self.image_columns = IMAGE_MIN_COLUMNS
 
         self._build_ui()
         self.refresh()
@@ -584,7 +587,7 @@ class App(tk.Tk):
         self.thumbnail_refs.clear()
         for child in self.list_frame.winfo_children():
             child.destroy()
-        for column in range(8):
+        for column in range(16):
             self.list_frame.columnconfigure(column, weight=0, minsize=0, uniform="")
         self.list_frame.columnconfigure(0, weight=1)
 
@@ -606,7 +609,16 @@ class App(tk.Tk):
 
     def _resize_list(self, event: tk.Event) -> None:
         self.canvas.itemconfigure(self.list_window, width=event.width)
+        if self.view_mode == "images":
+            columns = self.gallery_columns(event.width)
+            if columns != self.image_columns:
+                self.image_columns = columns
+                self.render_image_gallery()
         self._update_scroll_enabled()
+
+    def gallery_columns(self, width: int | None = None) -> int:
+        available_width = width or self.canvas.winfo_width()
+        return max(IMAGE_MIN_COLUMNS, available_width // IMAGE_CARD_MIN_WIDTH)
 
     def _on_mousewheel(self, event: tk.Event) -> None:
         if not getattr(self, "scroll_enabled", False):
@@ -844,6 +856,10 @@ class App(tk.Tk):
                 continue
             self.visible_images.append(image)
 
+        self.image_columns = self.gallery_columns()
+        self.render_image_gallery()
+
+    def render_image_gallery(self) -> None:
         self.clear_list()
         if not self.visible_images:
             tk.Label(
@@ -857,7 +873,7 @@ class App(tk.Tk):
             self.update_status()
             return
 
-        for column in range(4):
+        for column in range(self.image_columns):
             self.list_frame.columnconfigure(column, weight=1, uniform="image_cards")
         for idx, image in enumerate(self.visible_images):
             self.render_image_card(idx, image)
@@ -868,7 +884,13 @@ class App(tk.Tk):
         key = self.image_key(image)
         item = tk.Frame(self.list_frame, bg=COLORS["row"], bd=0, highlightthickness=1)
         item.configure(highlightbackground=COLORS["border"], highlightcolor=COLORS["border"])
-        item.grid(row=idx // 4, column=idx % 4, sticky="nsew", padx=(0, 8), pady=(0, 8))
+        item.grid(
+            row=idx // self.image_columns,
+            column=idx % self.image_columns,
+            sticky="nsew",
+            padx=(0, 8),
+            pady=(0, 8),
+        )
         item.columnconfigure(0, weight=1)
 
         var = tk.BooleanVar(value=key in self.checked_image_paths)
