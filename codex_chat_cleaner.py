@@ -371,9 +371,15 @@ class App(tk.Tk):
 
         self.rows: list[ThreadRow] = []
         self.visible_rows: list[ThreadRow] = []
+        self.images: list[GeneratedImage] = []
+        self.visible_images: list[GeneratedImage] = []
         self.checked_ids: set[str] = set()
+        self.checked_image_paths: set[str] = set()
         self.check_vars: dict[str, tk.BooleanVar] = {}
+        self.image_check_vars: dict[str, tk.BooleanVar] = {}
+        self.thumbnail_refs: list[tk.PhotoImage] = []
         self.search_text = tk.StringVar(value="")
+        self.view_mode = "sessions"
 
         self._build_ui()
         self.refresh()
@@ -426,16 +432,18 @@ class App(tk.Tk):
         top.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 10))
         top.columnconfigure(2, weight=1)
 
-        tk.Label(
+        self.view_title_label = tk.Label(
             top,
             text="채팅 세션",
             bg=COLORS["bg"],
             fg=COLORS["text"],
             font=FONT_TITLE,
             anchor="w",
-        ).grid(row=0, column=0, sticky="w", padx=(0, 12))
+        )
+        self.view_title_label.grid(row=0, column=0, sticky="w", padx=(0, 12))
 
-        self._button(top, "이미지 관리", self.open_image_manager).grid(
+        self.mode_button = self._button(top, "이미지 관리", self.open_image_manager)
+        self.mode_button.grid(
             row=0, column=1, sticky="w", padx=(0, 10)
         )
 
@@ -454,18 +462,9 @@ class App(tk.Tk):
 
         self._button(top, "새로고침", self.refresh).grid(row=0, column=3, padx=(8, 0))
 
-        header = tk.Frame(main, bg=COLORS["bg"])
-        header.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 4))
-        self._configure_row_grid(header)
-        for column, text in enumerate(["", "수정일", "제목", "출처", "모델", "폴더"]):
-            tk.Label(
-                header,
-                text=text,
-                bg=COLORS["bg"],
-                fg=COLORS["muted"],
-                font=FONT_BOLD,
-                anchor="w",
-            ).grid(row=0, column=column, sticky="ew", padx=(0, 8))
+        self.header = tk.Frame(main, bg=COLORS["bg"])
+        self.header.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 4))
+        self.render_header(["", "수정일", "제목", "출처", "모델", "폴더"])
 
         body = tk.Frame(main, bg=COLORS["bg"])
         body.grid(row=2, column=0, sticky="nsew", padx=(18, 10), pady=(0, 0))
@@ -489,15 +488,12 @@ class App(tk.Tk):
         bottom = tk.Frame(main, bg=COLORS["bg"])
         bottom.grid(row=3, column=0, sticky="ew", padx=18, pady=(10, 14))
         bottom.columnconfigure(0, weight=1)
-        self._button(bottom, "보이는 항목 모두 체크", self.check_visible).grid(
-            row=0, column=1, padx=6
-        )
-        self._button(bottom, "체크 해제", self.clear_checks).grid(
-            row=0, column=2, padx=(0, 6)
-        )
-        self._button(bottom, "체크한 항목 삭제", self.delete_checked, danger=True).grid(
-            row=0, column=3
-        )
+        self.check_all_button = self._button(bottom, "보이는 항목 모두 체크", self.check_visible)
+        self.check_all_button.grid(row=0, column=1, padx=6)
+        self.clear_button = self._button(bottom, "체크 해제", self.clear_checks)
+        self.clear_button.grid(row=0, column=2, padx=(0, 6))
+        self.delete_button = self._button(bottom, "체크한 항목 삭제", self.delete_checked, danger=True)
+        self.delete_button.grid(row=0, column=3)
 
     def _sidebar_line(self, parent: tk.Frame, label: str, value: str, row: int) -> tk.Label:
         frame = tk.Frame(parent, bg=COLORS["sidebar"])
@@ -558,6 +554,52 @@ class App(tk.Tk):
         frame.columnconfigure(4, minsize=72)
         frame.columnconfigure(5, minsize=64)
 
+    def _configure_image_grid(self, frame: tk.Widget) -> None:
+        frame.columnconfigure(0, minsize=42)
+        frame.columnconfigure(1, minsize=150)
+        frame.columnconfigure(2, weight=1)
+        frame.columnconfigure(3, minsize=120)
+        frame.columnconfigure(4, minsize=110)
+        frame.columnconfigure(5, minsize=84)
+
+    def render_header(self, labels: list[str]) -> None:
+        for child in self.header.winfo_children():
+            child.destroy()
+        if self.view_mode == "images":
+            self._configure_image_grid(self.header)
+        else:
+            self._configure_row_grid(self.header)
+        for column, text in enumerate(labels):
+            tk.Label(
+                self.header,
+                text=text,
+                bg=COLORS["bg"],
+                fg=COLORS["muted"],
+                font=FONT_BOLD,
+                anchor="w",
+            ).grid(row=0, column=column, sticky="ew", padx=(0, 8))
+
+    def clear_list(self) -> None:
+        self.check_vars.clear()
+        self.image_check_vars.clear()
+        self.thumbnail_refs.clear()
+        for child in self.list_frame.winfo_children():
+            child.destroy()
+
+    def update_view_controls(self) -> None:
+        if self.view_mode == "images":
+            self.view_title_label.configure(text="이미지 관리")
+            self.mode_button.configure(text="채팅 세션")
+            self.check_all_button.configure(text="보이는 이미지 모두 체크")
+            self.delete_button.configure(text="선택 이미지 삭제")
+            self.render_header(["", "미리보기", "파일 이름", "수정일", "크기", "폴더"])
+        else:
+            self.view_title_label.configure(text="채팅 세션")
+            self.mode_button.configure(text="이미지 관리")
+            self.check_all_button.configure(text="보이는 항목 모두 체크")
+            self.delete_button.configure(text="체크한 항목 삭제")
+            self.render_header(["", "수정일", "제목", "출처", "모델", "폴더"])
+
     def _resize_list(self, event: tk.Event) -> None:
         self.canvas.itemconfigure(self.list_window, width=event.width)
         self._update_scroll_enabled()
@@ -579,17 +621,32 @@ class App(tk.Tk):
         self.scroll_enabled = content_height > self.canvas.winfo_height()
 
     def refresh(self) -> None:
-        try:
-            self.rows = fetch_threads()
-            existing_ids = {row.thread_id for row in self.rows}
-            self.checked_ids &= existing_ids
-        except Exception as exc:
-            messagebox.showerror("불러오기 실패", str(exc))
-            self.rows = []
-            self.checked_ids.clear()
+        if self.view_mode == "images":
+            try:
+                self.images = fetch_generated_images()
+                existing = {self.image_key(image) for image in self.images}
+                self.checked_image_paths &= existing
+            except Exception as exc:
+                messagebox.showerror("이미지 불러오기 실패", str(exc))
+                self.images = []
+                self.checked_image_paths.clear()
+        else:
+            try:
+                self.rows = fetch_threads()
+                existing_ids = {row.thread_id for row in self.rows}
+                self.checked_ids &= existing_ids
+            except Exception as exc:
+                messagebox.showerror("불러오기 실패", str(exc))
+                self.rows = []
+                self.checked_ids.clear()
         self.apply_filter()
 
     def apply_filter(self) -> None:
+        self.update_view_controls()
+        if self.view_mode == "images":
+            self.apply_image_filter()
+            return
+
         needle = self.search_text.get().strip().lower()
         self.visible_rows = []
         for row in self.rows:
@@ -600,9 +657,7 @@ class App(tk.Tk):
                 continue
             self.visible_rows.append(row)
 
-        self.check_vars.clear()
-        for child in self.list_frame.winfo_children():
-            child.destroy()
+        self.clear_list()
 
         if not self.visible_rows:
             tk.Label(
@@ -714,9 +769,18 @@ class App(tk.Tk):
         os.startfile(primary)
 
     def open_image_manager(self) -> None:
-        ImageManagerWindow(self)
+        self.view_mode = "sessions" if self.view_mode == "images" else "images"
+        self.search_text.set("")
+        self.canvas.yview_moveto(0)
+        self.refresh()
 
     def update_status(self) -> None:
+        if self.view_mode == "images":
+            self.sidebar_total.configure(text=str(len(self.images)))
+            self.sidebar_visible.configure(text=str(len(self.visible_images)))
+            self.sidebar_checked.configure(text=str(len(self.checked_image_paths)))
+            return
+
         session_total = sum(1 for row in self.rows if not is_internal_review(row))
         self.sidebar_total.configure(text=str(session_total))
         self.sidebar_visible.configure(text=str(len(self.visible_rows)))
@@ -737,13 +801,197 @@ class App(tk.Tk):
         self.set_checked(thread_id, var.get())
 
     def check_visible(self) -> None:
+        if self.view_mode == "images":
+            for image in self.visible_images:
+                self.checked_image_paths.add(self.image_key(image))
+            self.apply_filter()
+            return
         for row in self.visible_rows:
             self.checked_ids.add(row.thread_id)
         self.apply_filter()
 
     def clear_checks(self) -> None:
+        if self.view_mode == "images":
+            self.checked_image_paths.clear()
+            self.apply_filter()
+            return
         self.checked_ids.clear()
         self.apply_filter()
+
+    def image_key(self, image: GeneratedImage) -> str:
+        return str(image.path.resolve()).lower()
+
+    def apply_image_filter(self) -> None:
+        needle = self.search_text.get().strip().lower()
+        self.visible_images = []
+        for image in self.images:
+            haystack = f"{image.path.name} {image.path.parent}".lower()
+            if needle and needle not in haystack:
+                continue
+            self.visible_images.append(image)
+
+        self.clear_list()
+        if not self.visible_images:
+            tk.Label(
+                self.list_frame,
+                text="표시할 이미지가 없습니다.",
+                bg=COLORS["bg"],
+                fg=COLORS["muted"],
+                font=FONT,
+                anchor="w",
+            ).grid(row=0, column=0, sticky="ew", padx=10, pady=14)
+            self.update_status()
+            return
+
+        for idx, image in enumerate(self.visible_images):
+            self.render_image_row(idx, image)
+        self.update_status()
+        self._update_scroll_enabled()
+
+    def render_image_row(self, idx: int, image: GeneratedImage) -> None:
+        key = self.image_key(image)
+        item = tk.Frame(self.list_frame, bg=COLORS["row"], bd=0, highlightthickness=1)
+        item.configure(highlightbackground=COLORS["border"], highlightcolor=COLORS["border"])
+        item.grid(row=idx, column=0, sticky="ew", pady=(0, 6))
+        self._configure_image_grid(item)
+
+        var = tk.BooleanVar(value=key in self.checked_image_paths)
+        self.image_check_vars[key] = var
+        tk.Checkbutton(
+            item,
+            variable=var,
+            command=lambda image_key=key, check_var=var: self.set_image_checked(
+                image_key, check_var.get()
+            ),
+            bg=COLORS["row"],
+            activebackground=COLORS["row_hover"],
+            selectcolor=COLORS["field"],
+            fg=COLORS["text"],
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+        ).grid(row=0, column=0, sticky="n", padx=(8, 0), pady=10)
+
+        preview = self.load_thumbnail(image.path)
+        preview_frame = tk.Frame(item, width=136, height=96, bg=COLORS["field"])
+        preview_frame.grid(row=0, column=1, sticky="w", padx=(0, 12), pady=10)
+        preview_frame.grid_propagate(False)
+        if preview is not None:
+            self.thumbnail_refs.append(preview)
+            tk.Label(preview_frame, image=preview, bg=COLORS["field"]).place(
+                relx=0.5, rely=0.5, anchor="center"
+            )
+        else:
+            tk.Label(
+                preview_frame,
+                text="미리보기\n불가",
+                bg=COLORS["field"],
+                fg=COLORS["muted"],
+                font=FONT,
+                justify="center",
+            ).place(relx=0.5, rely=0.5, anchor="center")
+
+        name_label = tk.Label(
+            item,
+            text=image.path.name,
+            bg=COLORS["row"],
+            fg=COLORS["text"],
+            font=FONT_BOLD,
+            anchor="w",
+        )
+        name_label.grid(row=0, column=2, sticky="ew", padx=(0, 8))
+        tk.Label(
+            item,
+            text=fmt_file_time(image.updated_at),
+            bg=COLORS["row"],
+            fg=COLORS["muted"],
+            font=FONT,
+            anchor="w",
+        ).grid(row=0, column=3, sticky="ew", padx=(0, 8))
+        tk.Label(
+            item,
+            text=fmt_size(image.size),
+            bg=COLORS["row"],
+            fg=COLORS["muted"],
+            font=FONT,
+            anchor="w",
+        ).grid(row=0, column=4, sticky="ew", padx=(0, 8))
+        self._button(item, "열기", lambda folder=image.path.parent: os.startfile(folder)).grid(
+            row=0, column=5, sticky="w", padx=(0, 8), pady=10
+        )
+
+        for widget in (item, name_label):
+            widget.bind("<Button-1>", lambda _event, image_key=key: self.toggle_image_checked(image_key))
+            widget.bind(
+                "<Enter>",
+                lambda _event, row_frame=item: self._set_row_bg(row_frame, COLORS["row_hover"]),
+            )
+            widget.bind(
+                "<Leave>",
+                lambda _event, row_frame=item: self._set_row_bg(row_frame, COLORS["row"]),
+            )
+
+    def load_thumbnail(self, path: Path) -> tk.PhotoImage | None:
+        try:
+            image = tk.PhotoImage(file=str(path))
+            factor = max(1, (image.width() + 135) // 136, (image.height() + 95) // 96)
+            return image.subsample(factor, factor)
+        except tk.TclError:
+            return None
+
+    def set_image_checked(self, image_key: str, checked: bool) -> None:
+        if checked:
+            self.checked_image_paths.add(image_key)
+        else:
+            self.checked_image_paths.discard(image_key)
+        self.update_status()
+
+    def toggle_image_checked(self, image_key: str) -> None:
+        var = self.image_check_vars.get(image_key)
+        if var is None:
+            return
+        var.set(not var.get())
+        self.set_image_checked(image_key, var.get())
+
+    def checked_images(self) -> list[GeneratedImage]:
+        return [
+            image
+            for image in self.images
+            if self.image_key(image) in self.checked_image_paths
+        ]
+
+    def delete_checked_images(self) -> None:
+        images = self.checked_images()
+        if not images:
+            messagebox.showinfo("체크 없음", "삭제할 이미지를 먼저 체크하세요.")
+            return
+
+        preview = "\n".join(f"- {image.path.name}" for image in images[:8])
+        if len(images) > 8:
+            preview += f"\n- ... 외 {len(images) - 8}개"
+        if not messagebox.askyesno(
+            "이미지 삭제 확인",
+            f"체크한 이미지 {len(images)}개를 삭제할까요?\n\n{preview}\n\n이미지가 사라진 빈 하위 폴더도 함께 삭제합니다.",
+        ):
+            return
+
+        try:
+            counts = delete_generated_images(images)
+        except Exception as exc:
+            messagebox.showerror("삭제 실패", str(exc))
+            return
+
+        self.checked_image_paths.difference_update(self.image_key(image) for image in images)
+        messagebox.showinfo(
+            "삭제 완료",
+            "\n".join(
+                [
+                    f"삭제한 이미지: {counts.get('image_files', 0)}개",
+                    f"삭제한 빈 이미지 폴더: {counts.get('empty_image_dirs', 0)}개",
+                ]
+            ),
+        )
+        self.refresh()
 
     def checked_rows(self) -> list[ThreadRow]:
         by_id = {row.thread_id: row for row in self.rows}
@@ -761,6 +1009,10 @@ class App(tk.Tk):
         return related
 
     def delete_checked(self) -> None:
+        if self.view_mode == "images":
+            self.delete_checked_images()
+            return
+
         rows = self.checked_rows()
         if not rows:
             messagebox.showinfo("체크 없음", "삭제할 채팅을 먼저 체크하세요.")
