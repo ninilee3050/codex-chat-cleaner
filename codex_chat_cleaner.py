@@ -1005,47 +1005,27 @@ class App(tk.Tk):
         if self.large_preview_window is not None and self.large_preview_window.winfo_exists():
             self.large_preview_window.destroy()
 
-        width = 840
-        height = 680
+        padding = 16
+        width = preview.width() + padding
+        height = preview.height() + padding
         window = tk.Toplevel(self)
         self.large_preview_window = window
         window.title("이미지 크게 보기")
         window.geometry(self.center_geometry(width, height))
-        window.minsize(520, 420)
+        window.resizable(False, False)
         window.configure(bg=COLORS["bg"])
         window.transient(self)
         window.large_preview_ref = preview
         window.protocol("WM_DELETE_WINDOW", lambda preview_window=window: self.close_large_preview(preview_window))
+        window.bind("<Escape>", lambda _event, preview_window=window: self.close_large_preview(preview_window))
 
-        tk.Label(
-            window,
-            text=path.name,
-            bg=COLORS["bg"],
-            fg=COLORS["text"],
-            font=FONT_BOLD,
-            anchor="w",
-        ).pack(fill="x", padx=16, pady=(14, 8))
-
-        preview_panel = tk.Frame(window, bg=COLORS["field"])
-        preview_panel.pack(fill="both", expand=True, padx=16, pady=(0, 12))
-        tk.Label(preview_panel, image=preview, bg=COLORS["field"]).place(
+        preview_panel = tk.Frame(window, bg=COLORS["bg"])
+        preview_panel.pack(fill="both", expand=True, padx=8, pady=8)
+        image_label = tk.Label(preview_panel, image=preview, bg=COLORS["bg"], cursor="hand2")
+        image_label.place(
             relx=0.5, rely=0.5, anchor="center"
         )
-
-        bottom = tk.Frame(window, bg=COLORS["bg"])
-        bottom.pack(fill="x", padx=16, pady=(0, 14))
-        bottom.columnconfigure(0, weight=1)
-        tk.Label(
-            bottom,
-            text=str(path.parent),
-            bg=COLORS["bg"],
-            fg=COLORS["subtle"],
-            font=FONT,
-            anchor="w",
-        ).grid(row=0, column=0, sticky="ew", padx=(0, 8))
-        self._button(bottom, "닫기", lambda preview_window=window: self.close_large_preview(preview_window)).grid(
-            row=0, column=1, sticky="e"
-        )
+        image_label.bind("<Button-1>", lambda _event, preview_window=window: self.close_large_preview(preview_window))
 
     def center_geometry(self, width: int, height: int) -> str:
         self.update_idletasks()
