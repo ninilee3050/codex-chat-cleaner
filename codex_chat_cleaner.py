@@ -383,6 +383,7 @@ class App(tk.Tk):
         self.search_text = tk.StringVar(value="")
         self.view_mode = "sessions"
         self.image_columns = IMAGE_MIN_COLUMNS
+        self.large_preview_window: tk.Toplevel | None = None
 
         self._build_ui()
         self.refresh()
@@ -1001,13 +1002,20 @@ class App(tk.Tk):
             messagebox.showinfo("미리보기 불가", "이 이미지는 크게 볼 수 없습니다.")
             return
 
+        if self.large_preview_window is not None and self.large_preview_window.winfo_exists():
+            self.large_preview_window.destroy()
+
+        width = 840
+        height = 680
         window = tk.Toplevel(self)
+        self.large_preview_window = window
         window.title("이미지 크게 보기")
-        window.geometry("840x680")
+        window.geometry(self.center_geometry(width, height))
         window.minsize(520, 420)
         window.configure(bg=COLORS["bg"])
         window.transient(self)
         window.large_preview_ref = preview
+        window.protocol("WM_DELETE_WINDOW", lambda preview_window=window: self.close_large_preview(preview_window))
 
         tk.Label(
             window,
@@ -1035,7 +1043,25 @@ class App(tk.Tk):
             font=FONT,
             anchor="w",
         ).grid(row=0, column=0, sticky="ew", padx=(0, 8))
-        self._button(bottom, "닫기", window.destroy).grid(row=0, column=1, sticky="e")
+        self._button(bottom, "닫기", lambda preview_window=window: self.close_large_preview(preview_window)).grid(
+            row=0, column=1, sticky="e"
+        )
+
+    def center_geometry(self, width: int, height: int) -> str:
+        self.update_idletasks()
+        parent_x = self.winfo_rootx()
+        parent_y = self.winfo_rooty()
+        parent_width = max(self.winfo_width(), 1)
+        parent_height = max(self.winfo_height(), 1)
+        x = max(parent_x + (parent_width - width) // 2, 0)
+        y = max(parent_y + (parent_height - height) // 2, 0)
+        return f"{width}x{height}+{x}+{y}"
+
+    def close_large_preview(self, window: tk.Toplevel) -> None:
+        if window.winfo_exists():
+            window.destroy()
+        if self.large_preview_window is window:
+            self.large_preview_window = None
 
     def set_image_checked(self, image_key: str, checked: bool) -> None:
         if checked:
