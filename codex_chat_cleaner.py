@@ -991,9 +991,11 @@ class App(tk.Tk):
         except tk.TclError:
             return None
 
-    def load_large_preview(self, path: Path, max_width: int = 760, max_height: int = 560) -> tk.PhotoImage | None:
+    def load_large_preview(self, path: Path) -> tk.PhotoImage | None:
         try:
             image = tk.PhotoImage(file=str(path))
+            max_width = int(self.winfo_screenwidth() * 0.65)
+            max_height = int(self.winfo_screenheight() * 0.65)
             factor = max(
                 1,
                 (image.width() + max_width - 1) // max_width,
