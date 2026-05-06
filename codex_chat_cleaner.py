@@ -953,8 +953,15 @@ class App(tk.Tk):
             font=FONT,
             anchor="w",
         ).grid(row=3, column=0, sticky="ew", padx=10, pady=(4, 8))
-        self._button(item, "열기", lambda folder=image.path.parent: os.startfile(folder)).grid(
-            row=4, column=0, sticky="ew", padx=10, pady=(0, 10)
+        actions = tk.Frame(item, bg=COLORS["row"])
+        actions.grid(row=4, column=0, sticky="ew", padx=10, pady=(0, 10))
+        actions.columnconfigure(0, weight=1)
+        actions.columnconfigure(1, weight=1)
+        self._button(actions, "크게 보기", lambda image_path=image.path: self.show_large_image(image_path)).grid(
+            row=0, column=0, sticky="ew", padx=(0, 4)
+        )
+        self._button(actions, "폴더 열기", lambda folder=image.path.parent: os.startfile(folder)).grid(
+            row=0, column=1, sticky="ew", padx=(4, 0)
         )
 
         for widget in (item, name_label, preview_frame, preview_widget):
@@ -975,6 +982,60 @@ class App(tk.Tk):
             return image.subsample(factor, factor)
         except tk.TclError:
             return None
+
+    def load_large_preview(self, path: Path, max_width: int = 760, max_height: int = 560) -> tk.PhotoImage | None:
+        try:
+            image = tk.PhotoImage(file=str(path))
+            factor = max(
+                1,
+                (image.width() + max_width - 1) // max_width,
+                (image.height() + max_height - 1) // max_height,
+            )
+            return image.subsample(factor, factor)
+        except tk.TclError:
+            return None
+
+    def show_large_image(self, path: Path) -> None:
+        preview = self.load_large_preview(path)
+        if preview is None:
+            messagebox.showinfo("미리보기 불가", "이 이미지는 크게 볼 수 없습니다.")
+            return
+
+        window = tk.Toplevel(self)
+        window.title("이미지 크게 보기")
+        window.geometry("840x680")
+        window.minsize(520, 420)
+        window.configure(bg=COLORS["bg"])
+        window.transient(self)
+        window.large_preview_ref = preview
+
+        tk.Label(
+            window,
+            text=path.name,
+            bg=COLORS["bg"],
+            fg=COLORS["text"],
+            font=FONT_BOLD,
+            anchor="w",
+        ).pack(fill="x", padx=16, pady=(14, 8))
+
+        preview_panel = tk.Frame(window, bg=COLORS["field"])
+        preview_panel.pack(fill="both", expand=True, padx=16, pady=(0, 12))
+        tk.Label(preview_panel, image=preview, bg=COLORS["field"]).place(
+            relx=0.5, rely=0.5, anchor="center"
+        )
+
+        bottom = tk.Frame(window, bg=COLORS["bg"])
+        bottom.pack(fill="x", padx=16, pady=(0, 14))
+        bottom.columnconfigure(0, weight=1)
+        tk.Label(
+            bottom,
+            text=str(path.parent),
+            bg=COLORS["bg"],
+            fg=COLORS["subtle"],
+            font=FONT,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self._button(bottom, "닫기", window.destroy).grid(row=0, column=1, sticky="e")
 
     def set_image_checked(self, image_key: str, checked: bool) -> None:
         if checked:
