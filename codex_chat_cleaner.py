@@ -1046,6 +1046,56 @@ class App(tk.Tk):
         y = max(parent_y + (parent_height - height) // 2, 0)
         return f"{width}x{height}+{x}+{y}"
 
+    def ask_centered(self, title: str, message: str, confirm_text: str = "삭제") -> bool:
+        result = tk.BooleanVar(value=False)
+        window = tk.Toplevel(self)
+        window.title(title)
+        window.geometry(self.center_geometry(520, 320))
+        window.minsize(460, 260)
+        window.configure(bg=COLORS["bg"])
+        window.transient(self)
+        window.grab_set()
+
+        tk.Label(
+            window,
+            text=title,
+            bg=COLORS["bg"],
+            fg=COLORS["text"],
+            font=FONT_TITLE,
+            anchor="w",
+        ).pack(fill="x", padx=16, pady=(16, 8))
+
+        text = tk.Text(
+            window,
+            bg=COLORS["field"],
+            fg=COLORS["text"],
+            insertbackground=COLORS["text"],
+            relief="flat",
+            bd=0,
+            font=FONT,
+            wrap="word",
+            height=10,
+        )
+        text.pack(fill="both", expand=True, padx=16, pady=(0, 12))
+        text.insert("1.0", message)
+        text.configure(state="disabled")
+
+        bottom = tk.Frame(window, bg=COLORS["bg"])
+        bottom.pack(fill="x", padx=16, pady=(0, 16))
+        bottom.columnconfigure(0, weight=1)
+
+        def confirm() -> None:
+            result.set(True)
+            window.destroy()
+
+        self._button(bottom, "취소", window.destroy).grid(row=0, column=1, sticky="e", padx=(0, 8))
+        self._button(bottom, confirm_text, confirm, danger=True).grid(row=0, column=2, sticky="e")
+
+        window.bind("<Escape>", lambda _event: window.destroy())
+        window.bind("<Return>", lambda _event: confirm())
+        window.wait_window()
+        return result.get()
+
     def close_large_preview(self, window: tk.Toplevel) -> None:
         if window.winfo_exists():
             window.destroy()
@@ -1082,7 +1132,7 @@ class App(tk.Tk):
         preview = "\n".join(f"- {image.path.name}" for image in images[:8])
         if len(images) > 8:
             preview += f"\n- ... 외 {len(images) - 8}개"
-        if not messagebox.askyesno(
+        if not self.ask_centered(
             "이미지 삭제 확인",
             f"체크한 이미지 {len(images)}개를 삭제할까요?\n\n{preview}\n\n이미지가 사라진 빈 하위 폴더도 함께 삭제합니다.",
         ):
@@ -1140,7 +1190,7 @@ class App(tk.Tk):
         related_msg = ""
         if related_rows:
             related_msg = f"\n\n관련 내부 검토 기록 {len(related_rows)}개도 함께 삭제합니다."
-        if not messagebox.askyesno(
+        if not self.ask_centered(
             "삭제 확인",
             f"체크한 채팅 {len(rows)}개를 삭제할까요?\n\n{preview}{related_msg}\n\n최근 목록 DB와 실제 세션 파일을 함께 삭제합니다.",
         ):
