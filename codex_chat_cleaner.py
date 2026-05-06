@@ -367,7 +367,7 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Codex 채팅 삭제기")
-        self.geometry("980x560")
+        self.geometry(self.screen_center_geometry(980, 560))
         self.minsize(860, 440)
         self.configure(bg=COLORS["bg"])
 
@@ -387,6 +387,13 @@ class App(tk.Tk):
 
         self._build_ui()
         self.refresh()
+
+    def screen_center_geometry(self, width: int, height: int) -> str:
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        x = max((screen_width - width) // 2, 0)
+        y = max((screen_height - height) // 2, 0)
+        return f"{width}x{height}+{x}+{y}"
 
     def _build_ui(self) -> None:
         self.columnconfigure(1, weight=1)
