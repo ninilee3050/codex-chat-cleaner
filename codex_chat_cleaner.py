@@ -13,11 +13,13 @@ from tkinter import messagebox, ttk
 
 CODEX_HOME = Path(r"C:\Users\user\.codex")
 SESSIONS_ROOT = CODEX_HOME / "sessions"
+GENERATED_IMAGES_ROOT = CODEX_HOME / "generated_images"
 WORKSPACES_ROOT = Path(r"C:\Users\user\Documents\Codex")
 STATE_DB = CODEX_HOME / "state_5.sqlite"
 SESSION_INDEX = CODEX_HOME / "session_index.jsonl"
 GLOBAL_STATE = CODEX_HOME / ".codex-global-state.json"
 INTERNAL_REVIEW_PREFIX = "The following is the Codex agent history"
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 
 COLORS = {
     "bg": "#171717",
@@ -55,10 +57,31 @@ class ThreadRow:
     cwd: Path | None
 
 
+@dataclass(frozen=True)
+class GeneratedImage:
+    path: Path
+    size: int
+    updated_at: float
+
+
 def fmt_time(ts: int) -> str:
     if not ts:
         return ""
     return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
+
+def fmt_file_time(ts: float) -> str:
+    if not ts:
+        return ""
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
+
+def fmt_size(size: int) -> str:
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / (1024 * 1024):.1f} MB"
 
 
 def ensure_under(path: Path, root: Path) -> Path:
@@ -98,6 +121,54 @@ def fetch_threads() -> list[ThreadRow]:
         )
         for row in rows
     ]
+
+
+def fetch_generated_images() -> list[GeneratedImage]:
+    if not GENERATED_IMAGES_ROOT.exists():
+        return []
+    images: list[GeneratedImage] = []
+    for path in GENERATED_IMAGES_ROOT.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in IMAGE_EXTENSIONS:
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        images.append(GeneratedImage(path=path, size=stat.st_size, updated_at=stat.st_mtime))
+    return sorted(images, key=lambda item: item.updated_at, reverse=True)
+
+
+def delete_generated_images(images: list[GeneratedImage]) -> dict[str, int]:
+    deleted_files = 0
+    folders_to_check: set[Path] = set()
+
+    for image in images:
+        safe_path = ensure_under(image.path, GENERATED_IMAGES_ROOT)
+        if not safe_path.exists() or not safe_path.is_file():
+            continue
+        safe_path.unlink()
+        deleted_files += 1
+        folders_to_check.add(safe_path.parent)
+
+    deleted_folders = 0
+    root = GENERATED_IMAGES_ROOT.resolve()
+    for folder in sorted(folders_to_check, key=lambda item: len(item.parts), reverse=True):
+        current = folder.resolve()
+        while current != root:
+            try:
+                current.relative_to(root)
+            except ValueError:
+                break
+            if not current.exists() or not current.is_dir():
+                current = current.parent
+                continue
+            if any(current.iterdir()):
+                break
+            current.rmdir()
+            deleted_folders += 1
+            current = current.parent
+
+    return {"image_files": deleted_files, "empty_image_dirs": deleted_folders}
 
 
 def parse_windows_path(raw_path: str) -> Path | None:
@@ -353,7 +424,7 @@ class App(tk.Tk):
 
         top = tk.Frame(main, bg=COLORS["bg"])
         top.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 10))
-        top.columnconfigure(1, weight=1)
+        top.columnconfigure(2, weight=1)
 
         tk.Label(
             top,
@@ -363,6 +434,10 @@ class App(tk.Tk):
             font=FONT_TITLE,
             anchor="w",
         ).grid(row=0, column=0, sticky="w", padx=(0, 12))
+
+        self._button(top, "이미지 관리", self.open_image_manager).grid(
+            row=0, column=1, sticky="w", padx=(0, 10)
+        )
 
         search = tk.Entry(
             top,
@@ -374,10 +449,10 @@ class App(tk.Tk):
             bd=0,
             font=FONT,
         )
-        search.grid(row=0, column=1, sticky="ew", ipady=7)
+        search.grid(row=0, column=2, sticky="ew", ipady=7)
         search.bind("<KeyRelease>", lambda _event: self.apply_filter())
 
-        self._button(top, "새로고침", self.refresh).grid(row=0, column=2, padx=(8, 0))
+        self._button(top, "새로고침", self.refresh).grid(row=0, column=3, padx=(8, 0))
 
         header = tk.Frame(main, bg=COLORS["bg"])
         header.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 4))
@@ -638,6 +713,9 @@ class App(tk.Tk):
             return
         os.startfile(primary)
 
+    def open_image_manager(self) -> None:
+        ImageManagerWindow(self)
+
     def update_status(self) -> None:
         session_total = sum(1 for row in self.rows if not is_internal_review(row))
         self.sidebar_total.configure(text=str(session_total))
@@ -723,6 +801,337 @@ class App(tk.Tk):
         if related_rows:
             msg.append(f"함께 삭제한 내부 검토 기록: {len(related_rows)}개")
         messagebox.showinfo("삭제 완료", "\n".join(msg))
+        self.refresh()
+
+
+class ImageManagerWindow(tk.Toplevel):
+    def __init__(self, parent: App) -> None:
+        super().__init__(parent)
+        self.title("Codex 이미지 관리")
+        self.geometry("900x620")
+        self.minsize(760, 460)
+        self.configure(bg=COLORS["bg"])
+        self.transient(parent)
+
+        self.images: list[GeneratedImage] = []
+        self.checked_paths: set[str] = set()
+        self.check_vars: dict[str, tk.BooleanVar] = {}
+        self.thumbnail_refs: list[tk.PhotoImage] = []
+        self.scroll_enabled = False
+
+        self._build_ui()
+        self.refresh()
+
+    def _build_ui(self) -> None:
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        top = tk.Frame(self, bg=COLORS["bg"])
+        top.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 10))
+        top.columnconfigure(1, weight=1)
+
+        tk.Label(
+            top,
+            text="이미지 관리",
+            bg=COLORS["bg"],
+            fg=COLORS["text"],
+            font=FONT_TITLE,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w", padx=(0, 12))
+        self.path_label = tk.Label(
+            top,
+            text=str(GENERATED_IMAGES_ROOT),
+            bg=COLORS["bg"],
+            fg=COLORS["subtle"],
+            font=FONT,
+            anchor="w",
+        )
+        self.path_label.grid(row=0, column=1, sticky="ew")
+        self._button(top, "새로고침", self.refresh).grid(row=0, column=2, padx=(8, 0))
+
+        body = tk.Frame(self, bg=COLORS["bg"])
+        body.grid(row=1, column=0, sticky="nsew", padx=(18, 10), pady=(0, 0))
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+
+        self.canvas = tk.Canvas(body, bg=COLORS["bg"], highlightthickness=0)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.canvas.configure(yscrollcommand=self._sync_scroll_state)
+
+        self.list_frame = tk.Frame(self.canvas, bg=COLORS["bg"])
+        self.list_frame.columnconfigure(0, weight=1)
+        self.list_window = self.canvas.create_window((0, 0), window=self.list_frame, anchor="nw")
+        self.list_frame.bind(
+            "<Configure>",
+            lambda _event: self.canvas.configure(scrollregion=self.canvas.bbox("all")),
+        )
+        self.canvas.bind("<Configure>", self._resize_list)
+        self.canvas.bind("<MouseWheel>", self._on_mousewheel)
+
+        bottom = tk.Frame(self, bg=COLORS["bg"])
+        bottom.grid(row=2, column=0, sticky="ew", padx=18, pady=(10, 14))
+        bottom.columnconfigure(0, weight=1)
+        self.status_label = tk.Label(
+            bottom,
+            text="이미지 0개 / 체크 0개",
+            bg=COLORS["bg"],
+            fg=COLORS["muted"],
+            font=FONT,
+            anchor="w",
+        )
+        self.status_label.grid(row=0, column=0, sticky="ew")
+        self._button(bottom, "보이는 이미지 모두 체크", self.check_all).grid(
+            row=0, column=1, padx=6
+        )
+        self._button(bottom, "체크 해제", self.clear_checks).grid(row=0, column=2, padx=(0, 6))
+        self._button(bottom, "선택 이미지 삭제", self.delete_checked, danger=True).grid(
+            row=0, column=3
+        )
+
+    def _button(
+        self,
+        parent: tk.Widget,
+        text: str,
+        command,
+        danger: bool = False,
+    ) -> tk.Button:
+        bg = COLORS["danger"] if danger else COLORS["button"]
+        hover = COLORS["danger_hover"] if danger else COLORS["button_hover"]
+        button = tk.Button(
+            parent,
+            text=text,
+            command=command,
+            bg=bg,
+            fg=COLORS["text"],
+            activebackground=hover,
+            activeforeground=COLORS["text"],
+            relief="flat",
+            bd=0,
+            padx=10,
+            pady=6,
+            font=FONT,
+            cursor="hand2",
+        )
+        button.bind("<Enter>", lambda _event: button.configure(bg=hover))
+        button.bind("<Leave>", lambda _event: button.configure(bg=bg))
+        return button
+
+    def _resize_list(self, event: tk.Event) -> None:
+        self.canvas.itemconfigure(self.list_window, width=event.width)
+        self._update_scroll_enabled()
+
+    def _on_mousewheel(self, event: tk.Event) -> None:
+        if not self.scroll_enabled:
+            return
+        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def _sync_scroll_state(self, first: str, last: str) -> None:
+        self.scroll_enabled = float(first) > 0.0 or float(last) < 1.0
+
+    def _update_scroll_enabled(self) -> None:
+        bbox = self.canvas.bbox("all")
+        if not bbox:
+            self.scroll_enabled = False
+            return
+        content_height = bbox[3] - bbox[1]
+        self.scroll_enabled = content_height > self.canvas.winfo_height()
+
+    def refresh(self) -> None:
+        try:
+            self.images = fetch_generated_images()
+        except Exception as exc:
+            messagebox.showerror("불러오기 실패", str(exc), parent=self)
+            self.images = []
+        existing = {str(image.path.resolve()).lower() for image in self.images}
+        self.checked_paths &= existing
+        self.render_images()
+
+    def render_images(self) -> None:
+        self.check_vars.clear()
+        self.thumbnail_refs.clear()
+        for child in self.list_frame.winfo_children():
+            child.destroy()
+
+        if not self.images:
+            tk.Label(
+                self.list_frame,
+                text="표시할 이미지가 없습니다.",
+                bg=COLORS["bg"],
+                fg=COLORS["muted"],
+                font=FONT,
+                anchor="w",
+            ).grid(row=0, column=0, sticky="ew", padx=10, pady=14)
+            self.update_status()
+            return
+
+        for idx, image in enumerate(self.images):
+            self._image_row(idx, image)
+        self.update_status()
+
+    def _image_row(self, idx: int, image: GeneratedImage) -> None:
+        key = str(image.path.resolve()).lower()
+        row = tk.Frame(self.list_frame, bg=COLORS["row"], bd=0, highlightthickness=1)
+        row.configure(highlightbackground=COLORS["border"], highlightcolor=COLORS["border"])
+        row.grid(row=idx, column=0, sticky="ew", pady=(0, 6))
+        row.columnconfigure(2, weight=1)
+
+        var = tk.BooleanVar(value=key in self.checked_paths)
+        self.check_vars[key] = var
+        tk.Checkbutton(
+            row,
+            variable=var,
+            command=lambda image_key=key, check_var=var: self.set_checked(
+                image_key, check_var.get()
+            ),
+            bg=COLORS["row"],
+            activebackground=COLORS["row_hover"],
+            selectcolor=COLORS["field"],
+            fg=COLORS["text"],
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+        ).grid(row=0, column=0, sticky="n", padx=(8, 0), pady=10)
+
+        preview = self._load_thumbnail(image.path)
+        preview_frame = tk.Frame(row, width=136, height=96, bg=COLORS["field"])
+        preview_frame.grid(row=0, column=1, sticky="w", padx=10, pady=10)
+        preview_frame.grid_propagate(False)
+        if preview is not None:
+            self.thumbnail_refs.append(preview)
+            tk.Label(preview_frame, image=preview, bg=COLORS["field"]).place(relx=0.5, rely=0.5, anchor="center")
+        else:
+            tk.Label(
+                preview_frame,
+                text="미리보기\n불가",
+                bg=COLORS["field"],
+                fg=COLORS["muted"],
+                font=FONT,
+                justify="center",
+            ).place(relx=0.5, rely=0.5, anchor="center")
+
+        info = tk.Frame(row, bg=COLORS["row"])
+        info.grid(row=0, column=2, sticky="nsew", padx=(0, 10), pady=10)
+        info.columnconfigure(0, weight=1)
+        tk.Label(
+            info,
+            text=image.path.name,
+            bg=COLORS["row"],
+            fg=COLORS["text"],
+            font=FONT_BOLD,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew")
+        tk.Label(
+            info,
+            text=f"{fmt_file_time(image.updated_at)}  /  {fmt_size(image.size)}",
+            bg=COLORS["row"],
+            fg=COLORS["muted"],
+            font=FONT,
+            anchor="w",
+        ).grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        tk.Label(
+            info,
+            text=str(image.path.parent),
+            bg=COLORS["row"],
+            fg=COLORS["subtle"],
+            font=FONT,
+            anchor="w",
+        ).grid(row=2, column=0, sticky="ew", pady=(4, 0))
+
+        self._button(row, "폴더 열기", lambda folder=image.path.parent: os.startfile(folder)).grid(
+            row=0, column=3, sticky="n", padx=(0, 10), pady=10
+        )
+
+        for widget in (row, info):
+            widget.bind("<Button-1>", lambda _event, image_key=key: self.toggle_checked(image_key))
+            widget.bind("<Enter>", lambda _event, row_frame=row: self._set_row_bg(row_frame, COLORS["row_hover"]))
+            widget.bind("<Leave>", lambda _event, row_frame=row: self._set_row_bg(row_frame, COLORS["row"]))
+
+    def _load_thumbnail(self, path: Path) -> tk.PhotoImage | None:
+        try:
+            image = tk.PhotoImage(file=str(path))
+            factor = max(1, (image.width() + 135) // 136, (image.height() + 95) // 96)
+            return image.subsample(factor, factor)
+        except tk.TclError:
+            return None
+
+    def _set_row_bg(self, row_frame: tk.Frame, color: str) -> None:
+        row_frame.configure(bg=color)
+        for child in row_frame.winfo_children():
+            try:
+                child.configure(bg=color, activebackground=color)
+            except tk.TclError:
+                pass
+            for grandchild in child.winfo_children():
+                try:
+                    grandchild.configure(bg=color, activebackground=color)
+                except tk.TclError:
+                    pass
+
+    def set_checked(self, image_key: str, checked: bool) -> None:
+        if checked:
+            self.checked_paths.add(image_key)
+        else:
+            self.checked_paths.discard(image_key)
+        self.update_status()
+
+    def toggle_checked(self, image_key: str) -> None:
+        var = self.check_vars.get(image_key)
+        if var is None:
+            return
+        var.set(not var.get())
+        self.set_checked(image_key, var.get())
+
+    def check_all(self) -> None:
+        self.checked_paths = {str(image.path.resolve()).lower() for image in self.images}
+        self.render_images()
+
+    def clear_checks(self) -> None:
+        self.checked_paths.clear()
+        self.render_images()
+
+    def checked_images(self) -> list[GeneratedImage]:
+        return [
+            image
+            for image in self.images
+            if str(image.path.resolve()).lower() in self.checked_paths
+        ]
+
+    def update_status(self) -> None:
+        self.status_label.configure(text=f"이미지 {len(self.images)}개 / 체크 {len(self.checked_paths)}개")
+
+    def delete_checked(self) -> None:
+        images = self.checked_images()
+        if not images:
+            messagebox.showinfo("체크 없음", "삭제할 이미지를 먼저 체크하세요.", parent=self)
+            return
+
+        preview = "\n".join(f"- {image.path.name}" for image in images[:8])
+        if len(images) > 8:
+            preview += f"\n- ... 외 {len(images) - 8}개"
+        if not messagebox.askyesno(
+            "이미지 삭제 확인",
+            f"체크한 이미지 {len(images)}개를 삭제할까요?\n\n{preview}\n\n이미지가 사라진 빈 하위 폴더도 함께 삭제합니다.",
+            parent=self,
+        ):
+            return
+
+        try:
+            counts = delete_generated_images(images)
+        except Exception as exc:
+            messagebox.showerror("삭제 실패", str(exc), parent=self)
+            return
+
+        self.checked_paths.difference_update(str(image.path.resolve()).lower() for image in images)
+        messagebox.showinfo(
+            "삭제 완료",
+            "\n".join(
+                [
+                    f"삭제한 이미지: {counts.get('image_files', 0)}개",
+                    f"삭제한 빈 이미지 폴더: {counts.get('empty_image_dirs', 0)}개",
+                ]
+            ),
+            parent=self,
+        )
         self.refresh()
 
 
