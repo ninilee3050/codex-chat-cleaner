@@ -410,9 +410,9 @@ class App(tk.Tk):
             anchor="w",
         ).grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 18))
 
-        self.sidebar_total = self._sidebar_line(sidebar, "전체 세션", "0", 2)
-        self.sidebar_visible = self._sidebar_line(sidebar, "표시 중", "0", 3)
-        self.sidebar_checked = self._sidebar_line(sidebar, "체크됨", "0", 4)
+        self.sidebar_total_label, self.sidebar_total = self._sidebar_line(sidebar, "전체 세션", "0", 2)
+        self.sidebar_visible_label, self.sidebar_visible = self._sidebar_line(sidebar, "표시 중", "0", 3)
+        self.sidebar_checked_label, self.sidebar_checked = self._sidebar_line(sidebar, "체크됨", "0", 4)
 
         tk.Label(
             sidebar,
@@ -432,20 +432,10 @@ class App(tk.Tk):
         top.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 10))
         top.columnconfigure(2, weight=1)
 
-        self.view_title_label = tk.Label(
-            top,
-            text="채팅 세션",
-            bg=COLORS["bg"],
-            fg=COLORS["text"],
-            font=FONT_TITLE,
-            anchor="w",
-        )
-        self.view_title_label.grid(row=0, column=0, sticky="w", padx=(0, 12))
-
-        self.mode_button = self._button(top, "이미지 관리", self.open_image_manager)
-        self.mode_button.grid(
-            row=0, column=1, sticky="w", padx=(0, 10)
-        )
+        self.session_button = self._button(top, "채팅 세션", self.show_sessions)
+        self.session_button.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.image_button = self._button(top, "이미지 관리", self.open_image_manager)
+        self.image_button.grid(row=0, column=1, sticky="w", padx=(0, 10))
 
         search = tk.Entry(
             top,
@@ -495,18 +485,21 @@ class App(tk.Tk):
         self.delete_button = self._button(bottom, "체크한 항목 삭제", self.delete_checked, danger=True)
         self.delete_button.grid(row=0, column=3)
 
-    def _sidebar_line(self, parent: tk.Frame, label: str, value: str, row: int) -> tk.Label:
+    def _sidebar_line(
+        self, parent: tk.Frame, label: str, value: str, row: int
+    ) -> tuple[tk.Label, tk.Label]:
         frame = tk.Frame(parent, bg=COLORS["sidebar"])
         frame.grid(row=row, column=0, sticky="ew", padx=14, pady=3)
         frame.columnconfigure(0, weight=1)
-        tk.Label(
+        label_widget = tk.Label(
             frame,
             text=label,
             bg=COLORS["sidebar"],
             fg=COLORS["muted"],
             font=FONT,
             anchor="w",
-        ).grid(row=0, column=0, sticky="ew")
+        )
+        label_widget.grid(row=0, column=0, sticky="ew")
         value_label = tk.Label(
             frame,
             text=value,
@@ -516,7 +509,7 @@ class App(tk.Tk):
             anchor="e",
         )
         value_label.grid(row=0, column=1, sticky="e")
-        return value_label
+        return label_widget, value_label
 
     def _button(
         self,
@@ -547,6 +540,8 @@ class App(tk.Tk):
         return button
 
     def _configure_row_grid(self, frame: tk.Widget) -> None:
+        for column in range(8):
+            frame.columnconfigure(column, weight=0, minsize=0, uniform="")
         frame.columnconfigure(0, minsize=42)
         frame.columnconfigure(1, minsize=128)
         frame.columnconfigure(2, weight=1)
@@ -555,6 +550,8 @@ class App(tk.Tk):
         frame.columnconfigure(5, minsize=64)
 
     def _configure_image_grid(self, frame: tk.Widget) -> None:
+        for column in range(8):
+            frame.columnconfigure(column, weight=0, minsize=0, uniform="")
         frame.columnconfigure(0, minsize=42)
         frame.columnconfigure(1, minsize=150)
         frame.columnconfigure(2, weight=1)
@@ -566,7 +563,9 @@ class App(tk.Tk):
         for child in self.header.winfo_children():
             child.destroy()
         if self.view_mode == "images":
-            self._configure_image_grid(self.header)
+            for column in range(8):
+                self.header.columnconfigure(column, weight=0, minsize=0, uniform="")
+            self.header.columnconfigure(0, weight=1)
         else:
             self._configure_row_grid(self.header)
         for column, text in enumerate(labels):
@@ -585,17 +584,22 @@ class App(tk.Tk):
         self.thumbnail_refs.clear()
         for child in self.list_frame.winfo_children():
             child.destroy()
+        for column in range(8):
+            self.list_frame.columnconfigure(column, weight=0, minsize=0, uniform="")
+        self.list_frame.columnconfigure(0, weight=1)
 
     def update_view_controls(self) -> None:
         if self.view_mode == "images":
-            self.view_title_label.configure(text="이미지 관리")
-            self.mode_button.configure(text="채팅 세션")
+            self.sidebar_total_label.configure(text="전체 이미지")
+            self.sidebar_visible_label.configure(text="표시 중")
+            self.sidebar_checked_label.configure(text="체크됨")
             self.check_all_button.configure(text="보이는 이미지 모두 체크")
             self.delete_button.configure(text="선택 이미지 삭제")
-            self.render_header(["", "미리보기", "파일 이름", "수정일", "크기", "폴더"])
+            self.render_header(["이미지 미리보기"])
         else:
-            self.view_title_label.configure(text="채팅 세션")
-            self.mode_button.configure(text="이미지 관리")
+            self.sidebar_total_label.configure(text="전체 세션")
+            self.sidebar_visible_label.configure(text="표시 중")
+            self.sidebar_checked_label.configure(text="체크됨")
             self.check_all_button.configure(text="보이는 항목 모두 체크")
             self.delete_button.configure(text="체크한 항목 삭제")
             self.render_header(["", "수정일", "제목", "출처", "모델", "폴더"])
@@ -768,8 +772,18 @@ class App(tk.Tk):
             return
         os.startfile(primary)
 
+    def show_sessions(self) -> None:
+        if self.view_mode == "sessions":
+            return
+        self.view_mode = "sessions"
+        self.search_text.set("")
+        self.canvas.yview_moveto(0)
+        self.refresh()
+
     def open_image_manager(self) -> None:
-        self.view_mode = "sessions" if self.view_mode == "images" else "images"
+        if self.view_mode == "images":
+            return
+        self.view_mode = "images"
         self.search_text.set("")
         self.canvas.yview_moveto(0)
         self.refresh()
@@ -843,21 +857,23 @@ class App(tk.Tk):
             self.update_status()
             return
 
+        for column in range(4):
+            self.list_frame.columnconfigure(column, weight=1, uniform="image_cards")
         for idx, image in enumerate(self.visible_images):
-            self.render_image_row(idx, image)
+            self.render_image_card(idx, image)
         self.update_status()
         self._update_scroll_enabled()
 
-    def render_image_row(self, idx: int, image: GeneratedImage) -> None:
+    def render_image_card(self, idx: int, image: GeneratedImage) -> None:
         key = self.image_key(image)
         item = tk.Frame(self.list_frame, bg=COLORS["row"], bd=0, highlightthickness=1)
         item.configure(highlightbackground=COLORS["border"], highlightcolor=COLORS["border"])
-        item.grid(row=idx, column=0, sticky="ew", pady=(0, 6))
-        self._configure_image_grid(item)
+        item.grid(row=idx // 4, column=idx % 4, sticky="nsew", padx=(0, 8), pady=(0, 8))
+        item.columnconfigure(0, weight=1)
 
         var = tk.BooleanVar(value=key in self.checked_image_paths)
         self.image_check_vars[key] = var
-        tk.Checkbutton(
+        check = tk.Checkbutton(
             item,
             variable=var,
             command=lambda image_key=key, check_var=var: self.set_image_checked(
@@ -870,11 +886,12 @@ class App(tk.Tk):
             relief="flat",
             bd=0,
             cursor="hand2",
-        ).grid(row=0, column=0, sticky="n", padx=(8, 0), pady=10)
+        )
+        check.grid(row=0, column=0, sticky="nw", padx=8, pady=8)
 
         preview = self.load_thumbnail(image.path)
-        preview_frame = tk.Frame(item, width=136, height=96, bg=COLORS["field"])
-        preview_frame.grid(row=0, column=1, sticky="w", padx=(0, 12), pady=10)
+        preview_frame = tk.Frame(item, width=188, height=132, bg=COLORS["field"])
+        preview_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
         preview_frame.grid_propagate(False)
         if preview is not None:
             self.thumbnail_refs.append(preview)
@@ -896,31 +913,25 @@ class App(tk.Tk):
             text=image.path.name,
             bg=COLORS["row"],
             fg=COLORS["text"],
-            font=FONT_BOLD,
+            font=FONT,
             anchor="w",
+            wraplength=180,
+            justify="left",
         )
-        name_label.grid(row=0, column=2, sticky="ew", padx=(0, 8))
+        name_label.grid(row=2, column=0, sticky="ew", padx=10)
         tk.Label(
             item,
-            text=fmt_file_time(image.updated_at),
+            text=f"{fmt_file_time(image.updated_at)}  /  {fmt_size(image.size)}",
             bg=COLORS["row"],
             fg=COLORS["muted"],
             font=FONT,
             anchor="w",
-        ).grid(row=0, column=3, sticky="ew", padx=(0, 8))
-        tk.Label(
-            item,
-            text=fmt_size(image.size),
-            bg=COLORS["row"],
-            fg=COLORS["muted"],
-            font=FONT,
-            anchor="w",
-        ).grid(row=0, column=4, sticky="ew", padx=(0, 8))
+        ).grid(row=3, column=0, sticky="ew", padx=10, pady=(4, 8))
         self._button(item, "열기", lambda folder=image.path.parent: os.startfile(folder)).grid(
-            row=0, column=5, sticky="w", padx=(0, 8), pady=10
+            row=4, column=0, sticky="ew", padx=10, pady=(0, 10)
         )
 
-        for widget in (item, name_label):
+        for widget in (item, name_label, preview_frame):
             widget.bind("<Button-1>", lambda _event, image_key=key: self.toggle_image_checked(image_key))
             widget.bind(
                 "<Enter>",
@@ -934,7 +945,7 @@ class App(tk.Tk):
     def load_thumbnail(self, path: Path) -> tk.PhotoImage | None:
         try:
             image = tk.PhotoImage(file=str(path))
-            factor = max(1, (image.width() + 135) // 136, (image.height() + 95) // 96)
+            factor = max(1, (image.width() + 187) // 188, (image.height() + 131) // 132)
             return image.subsample(factor, factor)
         except tk.TclError:
             return None
