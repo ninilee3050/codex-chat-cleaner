@@ -893,20 +893,24 @@ class App(tk.Tk):
         preview_frame = tk.Frame(item, width=188, height=132, bg=COLORS["field"])
         preview_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
         preview_frame.grid_propagate(False)
+        preview_widget: tk.Widget
         if preview is not None:
             self.thumbnail_refs.append(preview)
-            tk.Label(preview_frame, image=preview, bg=COLORS["field"]).place(
-                relx=0.5, rely=0.5, anchor="center"
+            preview_widget = tk.Label(
+                preview_frame, image=preview, bg=COLORS["field"], cursor="hand2"
             )
+            preview_widget.place(relx=0.5, rely=0.5, anchor="center")
         else:
-            tk.Label(
+            preview_widget = tk.Label(
                 preview_frame,
                 text="미리보기\n불가",
                 bg=COLORS["field"],
                 fg=COLORS["muted"],
                 font=FONT,
                 justify="center",
-            ).place(relx=0.5, rely=0.5, anchor="center")
+                cursor="hand2",
+            )
+            preview_widget.place(relx=0.5, rely=0.5, anchor="center")
 
         name_label = tk.Label(
             item,
@@ -931,7 +935,7 @@ class App(tk.Tk):
             row=4, column=0, sticky="ew", padx=10, pady=(0, 10)
         )
 
-        for widget in (item, name_label, preview_frame):
+        for widget in (item, name_label, preview_frame, preview_widget):
             widget.bind("<Button-1>", lambda _event, image_key=key: self.toggle_image_checked(image_key))
             widget.bind(
                 "<Enter>",
