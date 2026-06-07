@@ -40,6 +40,7 @@ MEMORIES_DB = find_latest_sqlite("memories_*.sqlite", "memories_1.sqlite")
 SESSION_INDEX = CODEX_HOME / "session_index.jsonl"
 GLOBAL_STATE = CODEX_HOME / ".codex-global-state.json"
 GLOBAL_STATE_FILES = (GLOBAL_STATE, GLOBAL_STATE.with_name(".codex-global-state.json.bak"))
+MANUAL_PROTECTION_FILE = CODEX_HOME / "chat_cleaner_protected_threads.json"
 INTERNAL_REVIEW_PREFIX = "The following is the Codex agent history"
 THREAD_ID_RE = re.compile(
     r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
@@ -424,6 +425,47 @@ def active_global_thread_ids() -> set[str]:
     return {item for item in projectless_ids if isinstance(item, str)}
 
 
+def read_manual_protected_thread_ids() -> set[str]:
+    if not MANUAL_PROTECTION_FILE.exists():
+        return set()
+    try:
+        data = json.loads(MANUAL_PROTECTION_FILE.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+
+    if isinstance(data, dict):
+        raw_ids = data.get("thread_ids")
+    else:
+        raw_ids = data
+    if not isinstance(raw_ids, list):
+        return set()
+    return {
+        item
+        for item in raw_ids
+        if isinstance(item, str) and THREAD_ID_RE.fullmatch(item)
+    }
+
+
+def write_manual_protected_thread_ids(thread_ids: set[str]) -> None:
+    if not thread_ids:
+        if MANUAL_PROTECTION_FILE.exists():
+            MANUAL_PROTECTION_FILE.unlink()
+        return
+    payload = {"thread_ids": sorted(thread_ids)}
+    MANUAL_PROTECTION_FILE.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def prune_manual_protected_thread_ids(existing_ids: set[str]) -> set[str]:
+    protected_ids = read_manual_protected_thread_ids()
+    kept_ids = protected_ids & existing_ids
+    if kept_ids != protected_ids:
+        write_manual_protected_thread_ids(kept_ids)
+    return kept_ids
+
+
 def clean_global_state_file(path: Path, target_ids: set[str]) -> int:
     if not path.exists():
         return 0
@@ -584,8 +626,8 @@ def orphan_rollout_files(state_ids: set[str]) -> list[Path]:
     return files
 
 
-def protected_thread_ids(rows: list[ThreadRow]) -> set[str]:
-    protected = active_global_thread_ids()
+def automatic_protected_thread_ids(rows: list[ThreadRow]) -> set[str]:
+    protected: set[str] = set()
     cutoff = int(time.time()) - 10 * 60
     for row in rows:
         if row.updated_at and row.updated_at >= cutoff:
@@ -593,9 +635,13 @@ def protected_thread_ids(rows: list[ThreadRow]) -> set[str]:
     return protected
 
 
+def protected_thread_ids(rows: list[ThreadRow]) -> set[str]:
+    return automatic_protected_thread_ids(rows) | read_manual_protected_thread_ids()
+
+
 def inspect_orphans() -> dict[str, object]:
     state_ids = fetch_thread_ids()
-    protected_ids = active_global_thread_ids()
+    protected_ids = active_global_thread_ids() | read_manual_protected_thread_ids()
     logs_ids = thread_ids_from_db(LOGS_DB, "logs", "thread_id")
     goals_ids = thread_ids_from_db(GOALS_DB, "thread_goals", "thread_id")
     memory_ids = thread_ids_from_db(MEMORIES_DB, "stage1_outputs", "thread_id")
@@ -726,7 +772,7 @@ def orphan_report_message(report: dict[str, object]) -> str:
             f"남은 rollout 파일: {report.get('orphan_rollout_files', 0)}개",
             f"빈 sessions 폴더: {report.get('empty_session_dirs', 0)}개",
             f"rollout 파일이 없는 state 세션: {report.get('broken_state_rollouts', 0)}개",
-            f"보호 중인 활성 세션: {report.get('protected_thread_ids', 0)}개",
+            f"보호 중인 세션: {report.get('protected_thread_ids', 0)}개",
         ]
     )
 
@@ -818,7 +864,9 @@ class App(tk.Tk):
         self.visible_images: list[GeneratedImage] = []
         self.checked_ids: set[str] = set()
         self.checked_image_paths: set[str] = set()
+        self.manual_protected_ids: set[str] = read_manual_protected_thread_ids()
         self.check_vars: dict[str, tk.BooleanVar] = {}
+        self.protect_vars: dict[str, tk.BooleanVar] = {}
         self.image_check_vars: dict[str, tk.BooleanVar] = {}
         self.thumbnail_refs: list[tk.PhotoImage] = []
         self.search_text = tk.StringVar(value="")
@@ -907,7 +955,7 @@ class App(tk.Tk):
 
         self.header = tk.Frame(main, bg=COLORS["bg"])
         self.header.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 4))
-        self.render_header(["", "수정일", "제목", "출처", "모델", "폴더"])
+        self.render_header(["", "보호", "수정일", "제목", "출처", "모델", "폴더"])
 
         body = tk.Frame(main, bg=COLORS["bg"])
         body.grid(row=2, column=0, sticky="nsew", padx=(18, 10), pady=(0, 0))
@@ -1000,11 +1048,12 @@ class App(tk.Tk):
         for column in range(8):
             frame.columnconfigure(column, weight=0, minsize=0, uniform="")
         frame.columnconfigure(0, minsize=42)
-        frame.columnconfigure(1, minsize=128)
-        frame.columnconfigure(2, weight=1)
-        frame.columnconfigure(3, minsize=72)
+        frame.columnconfigure(1, minsize=68)
+        frame.columnconfigure(2, minsize=128)
+        frame.columnconfigure(3, weight=1)
         frame.columnconfigure(4, minsize=72)
-        frame.columnconfigure(5, minsize=64)
+        frame.columnconfigure(5, minsize=72)
+        frame.columnconfigure(6, minsize=64)
 
     def _configure_image_grid(self, frame: tk.Widget) -> None:
         for column in range(8):
@@ -1037,6 +1086,7 @@ class App(tk.Tk):
 
     def clear_list(self) -> None:
         self.check_vars.clear()
+        self.protect_vars.clear()
         self.image_check_vars.clear()
         self.thumbnail_refs.clear()
         for child in self.list_frame.winfo_children():
@@ -1063,7 +1113,7 @@ class App(tk.Tk):
             self.compact_button.configure(state="normal")
             self.check_all_button.configure(text="보이는 항목 모두 체크")
             self.delete_button.configure(text="스마트 정리")
-            self.render_header(["", "수정일", "제목", "출처", "모델", "폴더"])
+            self.render_header(["", "보호", "수정일", "제목", "출처", "모델", "폴더"])
 
     def _resize_list(self, event: tk.Event) -> None:
         self.canvas.itemconfigure(self.list_window, width=event.width)
@@ -1108,6 +1158,7 @@ class App(tk.Tk):
             try:
                 self.rows = fetch_threads()
                 existing_ids = {row.thread_id for row in self.rows}
+                self.manual_protected_ids = prune_manual_protected_thread_ids(existing_ids)
                 self.checked_ids &= existing_ids - protected_thread_ids(self.rows)
             except Exception as exc:
                 messagebox.showerror("불러오기 실패", str(exc))
@@ -1145,16 +1196,21 @@ class App(tk.Tk):
             self.update_status()
             return
 
+        automatic_ids = automatic_protected_thread_ids(self.rows)
         protected_ids = protected_thread_ids(self.rows)
         for idx, row in enumerate(self.visible_rows):
+            is_manual_protected = row.thread_id in self.manual_protected_ids
+            is_auto_protected = row.thread_id in automatic_ids
             is_protected = row.thread_id in protected_ids
             item = tk.Frame(self.list_frame, bg=COLORS["row"], bd=0, highlightthickness=1)
             item.configure(highlightbackground=COLORS["border"], highlightcolor=COLORS["border"])
             item.grid(row=idx, column=0, sticky="ew", pady=(0, 5))
             self._configure_row_grid(item)
             title = row.title.replace("\r", " ").replace("\n", " ")[:120]
-            if is_protected:
+            if is_manual_protected:
                 title = f"{title} [보호]"
+            elif is_auto_protected:
+                title = f"{title} [자동보호]"
 
             var = tk.BooleanVar(value=row.thread_id in self.checked_ids)
             self.check_vars[row.thread_id] = var
@@ -1176,6 +1232,27 @@ class App(tk.Tk):
                 check.configure(state="disabled")
             check.grid(row=0, column=0, sticky="w", padx=(8, 0), pady=7)
 
+            protect_var = tk.BooleanVar(value=is_manual_protected)
+            self.protect_vars[row.thread_id] = protect_var
+            protect_check = tk.Checkbutton(
+                item,
+                text="보호",
+                variable=protect_var,
+                command=lambda thread_id=row.thread_id, protect=protect_var: self.set_manual_protected(
+                    thread_id, protect.get()
+                ),
+                bg=COLORS["row"],
+                activebackground=COLORS["row_hover"],
+                selectcolor=COLORS["field"],
+                fg=COLORS["muted"],
+                activeforeground=COLORS["text"],
+                relief="flat",
+                bd=0,
+                cursor="hand2",
+                font=FONT,
+            )
+            protect_check.grid(row=0, column=1, sticky="w", padx=(0, 8), pady=7)
+
             tk.Label(
                 item,
                 text=fmt_time(row.updated_at),
@@ -1183,7 +1260,7 @@ class App(tk.Tk):
                 fg=COLORS["muted"],
                 font=FONT,
                 anchor="w",
-            ).grid(row=0, column=1, sticky="ew", padx=(0, 8))
+            ).grid(row=0, column=2, sticky="ew", padx=(0, 8))
             title_label = tk.Label(
                 item,
                 text=title,
@@ -1192,7 +1269,7 @@ class App(tk.Tk):
                 font=FONT,
                 anchor="w",
             )
-            title_label.grid(row=0, column=2, sticky="ew", padx=(0, 8))
+            title_label.grid(row=0, column=3, sticky="ew", padx=(0, 8))
             tk.Label(
                 item,
                 text=row.source,
@@ -1200,7 +1277,7 @@ class App(tk.Tk):
                 fg=COLORS["muted"],
                 font=FONT,
                 anchor="w",
-            ).grid(row=0, column=3, sticky="ew", padx=(0, 8))
+            ).grid(row=0, column=4, sticky="ew", padx=(0, 8))
             tk.Label(
                 item,
                 text=row.provider,
@@ -1208,13 +1285,13 @@ class App(tk.Tk):
                 fg=COLORS["muted"],
                 font=FONT,
                 anchor="w",
-            ).grid(row=0, column=4, sticky="ew", padx=(0, 8))
+            ).grid(row=0, column=5, sticky="ew", padx=(0, 8))
             open_button = self._button(
                 item,
                 "열기",
                 lambda thread_row=row: self.open_workspace_dir(thread_row),
             )
-            open_button.grid(row=0, column=5, sticky="w", padx=(0, 8), pady=5)
+            open_button.grid(row=0, column=6, sticky="w", padx=(0, 8), pady=5)
             if first_existing_workspace(row) is None:
                 open_button.configure(state="disabled")
 
@@ -1276,6 +1353,20 @@ class App(tk.Tk):
         self.sidebar_total.configure(text=str(session_total))
         self.sidebar_visible.configure(text=str(len(self.visible_rows)))
         self.sidebar_checked.configure(text=str(len(self.checked_ids)))
+
+    def set_manual_protected(self, thread_id: str, protected: bool) -> None:
+        previous_ids = set(self.manual_protected_ids)
+        if protected:
+            self.manual_protected_ids.add(thread_id)
+            self.checked_ids.discard(thread_id)
+        else:
+            self.manual_protected_ids.discard(thread_id)
+        try:
+            write_manual_protected_thread_ids(self.manual_protected_ids)
+        except Exception as exc:
+            self.manual_protected_ids = previous_ids
+            messagebox.showerror("보호 저장 실패", str(exc))
+        self.apply_filter()
 
     def set_checked(self, thread_id: str, checked: bool) -> None:
         if checked and thread_id in protected_thread_ids(self.rows):
@@ -1341,7 +1432,7 @@ class App(tk.Tk):
             (
                 f"{orphan_report_message(report)}\n\n"
                 "state DB의 threads에 없는 기록만 정리합니다.\n"
-                "현재 활성 세션으로 보이는 항목은 보호합니다."
+                "현재 활성 또는 사용자가 보호한 항목은 보호합니다."
             ),
         ):
             return
@@ -1738,7 +1829,7 @@ class App(tk.Tk):
             (
                 f"삭제할 체크 세션: {len(rows_to_delete)}개\n"
                 f"정리할 남은 찌꺼기: {junk_count}개\n"
-                f"보호된 현재/최근 세션: {report.get('protected_thread_ids', 0)}개"
+                f"보호된 세션: {report.get('protected_thread_ids', 0)}개"
                 f"{checked_msg}\n\n"
                 "체크하지 않은 정상 세션은 삭제하지 않습니다.\n"
                 "보호 세션은 삭제하지 않습니다."
