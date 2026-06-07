@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 import tkinter as tk
 from dataclasses import dataclass
 from datetime import datetime
@@ -11,17 +12,44 @@ from pathlib import Path
 from tkinter import messagebox, ttk
 
 
-CODEX_HOME = Path(r"C:\Users\user\.codex")
+def sqlite_sort_key(path: Path) -> tuple[int, float]:
+    match = re.search(r"_(\d+)\.sqlite$", path.name)
+    version = int(match.group(1)) if match else -1
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    return (version, mtime)
+
+
+def find_latest_sqlite(pattern: str, fallback_name: str) -> Path:
+    candidates = [path for path in CODEX_HOME.glob(pattern) if path.is_file()]
+    if candidates:
+        return max(candidates, key=sqlite_sort_key)
+    return CODEX_HOME / fallback_name
+
+
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
 SESSIONS_ROOT = CODEX_HOME / "sessions"
 GENERATED_IMAGES_ROOT = CODEX_HOME / "generated_images"
-WORKSPACES_ROOT = Path(r"C:\Users\user\Documents\Codex")
-STATE_DB = CODEX_HOME / "state_5.sqlite"
+WORKSPACES_ROOT = Path.home() / "Documents" / "Codex"
+STATE_DB = find_latest_sqlite("state_*.sqlite", "state_5.sqlite")
+LOGS_DB = find_latest_sqlite("logs_*.sqlite", "logs_2.sqlite")
+GOALS_DB = find_latest_sqlite("goals_*.sqlite", "goals_1.sqlite")
+MEMORIES_DB = find_latest_sqlite("memories_*.sqlite", "memories_1.sqlite")
 SESSION_INDEX = CODEX_HOME / "session_index.jsonl"
 GLOBAL_STATE = CODEX_HOME / ".codex-global-state.json"
+GLOBAL_STATE_FILES = (GLOBAL_STATE, GLOBAL_STATE.with_name(".codex-global-state.json.bak"))
 INTERNAL_REVIEW_PREFIX = "The following is the Codex agent history"
+THREAD_ID_RE = re.compile(
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+    re.IGNORECASE,
+)
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 IMAGE_MIN_COLUMNS = 4
 IMAGE_CARD_MIN_WIDTH = 220
+COMPACT_MIN_RECLAIM_BYTES = 50 * 1024 * 1024
+COMPACT_MIN_RECLAIM_RATIO = 0.25
 
 COLORS = {
     "bg": "#171717",
@@ -92,17 +120,78 @@ def ensure_under(path: Path, root: Path) -> Path:
     return resolved
 
 
-def connect_state(write: bool = False) -> sqlite3.Connection:
+def connect_db(path: Path, write: bool = False) -> sqlite3.Connection:
     if write:
-        return sqlite3.connect(STATE_DB, timeout=20)
-    return sqlite3.connect(f"file:{STATE_DB}?mode=ro", uri=True)
+        return sqlite3.connect(path, timeout=20)
+    return sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=20)
+
+
+def connect_state(write: bool = False) -> sqlite3.Connection:
+    return connect_db(STATE_DB, write=write)
+
+
+def table_exists(cur: sqlite3.Cursor, table: str) -> bool:
+    row = cur.execute(
+        "select 1 from sqlite_master where type = 'table' and name = ?",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def column_exists(cur: sqlite3.Cursor, table: str, column: str) -> bool:
+    if not table_exists(cur, table):
+        return False
+    return any(row[1] == column for row in cur.execute(f'pragma table_info("{table}")'))
+
+
+def delete_by_ids(
+    db_path: Path,
+    table: str,
+    column: str,
+    target_ids: set[str],
+    counts: dict[str, int],
+    count_key: str,
+) -> None:
+    if not target_ids or not db_path.exists():
+        return
+    with connect_db(db_path, write=True) as con:
+        cur = con.cursor()
+        if not table_exists(cur, table):
+            counts["skipped_tables"] = counts.get("skipped_tables", 0) + 1
+            return
+        if not column_exists(cur, table, column):
+            counts["skipped_columns"] = counts.get("skipped_columns", 0) + 1
+            return
+        ids = sorted(target_ids)
+        for start in range(0, len(ids), 400):
+            chunk = ids[start:start + 400]
+            placeholders = ",".join("?" for _ in chunk)
+            cur.execute(
+                f'delete from "{table}" where "{column}" in ({placeholders})',
+                tuple(chunk),
+            )
+            counts[count_key] = counts.get(count_key, 0) + cur.rowcount
+        con.commit()
+
+
+def fetch_thread_ids() -> set[str]:
+    if not STATE_DB.exists():
+        return set()
+    with connect_state(write=False) as con:
+        cur = con.cursor()
+        if not table_exists(cur, "threads") or not column_exists(cur, "threads", "id"):
+            return set()
+        return {row[0] for row in cur.execute("select id from threads").fetchall()}
 
 
 def fetch_threads() -> list[ThreadRow]:
     if not STATE_DB.exists():
         raise FileNotFoundError(f"State DB not found:\n{STATE_DB}")
     with connect_state(write=False) as con:
-        rows = con.execute(
+        cur = con.cursor()
+        if not table_exists(cur, "threads"):
+            raise RuntimeError(f"threads table not found:\n{STATE_DB}")
+        rows = cur.execute(
             """
             select id, title, first_user_message, updated_at, source, model_provider, archived, rollout_path, cwd
             from threads
@@ -118,7 +207,7 @@ def fetch_threads() -> list[ThreadRow]:
             source=row[4] or "",
             provider=row[5] or "",
             archived=row[6] or 0,
-            rollout_path=Path(row[7]),
+            rollout_path=Path(row[7] or ""),
             cwd=parse_windows_path(row[8] or ""),
         )
         for row in rows
@@ -243,6 +332,21 @@ def is_related_internal_review(row: ThreadRow, target_ids: set[str]) -> bool:
     return any(thread_id in haystack for thread_id in target_ids)
 
 
+def read_session_index_ids() -> set[str]:
+    if not SESSION_INDEX.exists():
+        return set()
+    ids: set[str] = set()
+    for line in SESSION_INDEX.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        thread_id = item.get("id")
+        if isinstance(thread_id, str):
+            ids.add(thread_id)
+    return ids
+
+
 def filter_session_index(target_ids: set[str]) -> int:
     if not SESSION_INDEX.exists():
         return 0
@@ -263,10 +367,67 @@ def filter_session_index(target_ids: set[str]) -> int:
     return removed
 
 
-def clean_global_state(target_ids: set[str]) -> int:
+def json_thread_key_ids(value) -> set[str]:
+    ids: set[str] = set()
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if isinstance(key, str) and THREAD_ID_RE.fullmatch(key):
+                ids.add(key)
+            ids.update(json_thread_key_ids(child))
+    elif isinstance(value, list):
+        for child in value:
+            ids.update(json_thread_key_ids(child))
+    return ids
+
+
+def remove_thread_keys(value, target_ids: set[str]) -> int:
+    removed = 0
+    if isinstance(value, dict):
+        for key in list(value):
+            if isinstance(key, str) and key in target_ids:
+                del value[key]
+                removed += 1
+            else:
+                removed += remove_thread_keys(value[key], target_ids)
+    elif isinstance(value, list):
+        for child in value:
+            removed += remove_thread_keys(child, target_ids)
+    return removed
+
+
+def global_state_thread_ids() -> set[str]:
+    ids: set[str] = set()
+    for path in GLOBAL_STATE_FILES:
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        except json.JSONDecodeError:
+            continue
+        projectless_ids = data.get("projectless-thread-ids")
+        if isinstance(projectless_ids, list):
+            ids.update(item for item in projectless_ids if isinstance(item, str))
+        ids.update(json_thread_key_ids(data))
+    return ids
+
+
+def active_global_thread_ids() -> set[str]:
     if not GLOBAL_STATE.exists():
+        return set()
+    try:
+        data = json.loads(GLOBAL_STATE.read_text(encoding="utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return set()
+    projectless_ids = data.get("projectless-thread-ids")
+    if not isinstance(projectless_ids, list):
+        return set()
+    return {item for item in projectless_ids if isinstance(item, str)}
+
+
+def clean_global_state_file(path: Path, target_ids: set[str]) -> int:
+    if not path.exists():
         return 0
-    data = json.loads(GLOBAL_STATE.read_text(encoding="utf-8", errors="replace"))
+    data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
     removed = 0
 
     projectless_ids = data.get("projectless-thread-ids")
@@ -275,17 +436,20 @@ def clean_global_state(target_ids: set[str]) -> int:
         removed += len(projectless_ids) - len(new_ids)
         data["projectless-thread-ids"] = new_ids
 
-    hints = data.get("thread-workspace-root-hints")
-    if isinstance(hints, dict):
-        for thread_id in list(hints):
-            if thread_id in target_ids:
-                removed += 1
-                del hints[thread_id]
+    removed += remove_thread_keys(data, target_ids)
 
-    GLOBAL_STATE.write_text(
-        json.dumps(data, ensure_ascii=False, separators=(",", ":")),
-        encoding="utf-8",
-    )
+    if removed:
+        path.write_text(
+            json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+    return removed
+
+
+def clean_global_state(target_ids: set[str]) -> int:
+    removed = 0
+    for path in GLOBAL_STATE_FILES:
+        removed += clean_global_state_file(path, target_ids)
     return removed
 
 
@@ -323,43 +487,320 @@ def delete_empty_workspace_dirs(rows: list[ThreadRow]) -> dict[str, int]:
     }
 
 
+def delete_empty_session_dirs() -> int:
+    if not SESSIONS_ROOT.exists():
+        return 0
+    deleted = 0
+    root = SESSIONS_ROOT.resolve()
+    folders = sorted(
+        (path for path in SESSIONS_ROOT.rglob("*") if path.is_dir()),
+        key=lambda item: len(item.parts),
+        reverse=True,
+    )
+    for folder in folders:
+        try:
+            current = folder.resolve()
+            current.relative_to(root)
+        except (OSError, ValueError):
+            continue
+        if current == root:
+            continue
+        try:
+            if any(current.iterdir()):
+                continue
+            current.rmdir()
+            deleted += 1
+        except OSError:
+            continue
+    return deleted
+
+
+def count_empty_session_dirs() -> int:
+    if not SESSIONS_ROOT.exists():
+        return 0
+    count = 0
+    for folder in SESSIONS_ROOT.rglob("*"):
+        if not folder.is_dir():
+            continue
+        try:
+            if not any(folder.iterdir()):
+                count += 1
+        except OSError:
+            continue
+    return count
+
+
+def delete_rollout_files(paths: list[Path]) -> int:
+    deleted_files = 0
+    for path in paths:
+        if not path.name or not path.exists():
+            continue
+        safe_path = ensure_under(path, SESSIONS_ROOT)
+        if not safe_path.name.startswith("rollout-"):
+            raise RuntimeError(f"Unexpected session filename:\n{safe_path}")
+        safe_path.unlink()
+        deleted_files += 1
+    return deleted_files
+
+
+def thread_ids_from_db(db_path: Path, table: str, column: str) -> set[str]:
+    if not db_path.exists():
+        return set()
+    with connect_db(db_path, write=False) as con:
+        cur = con.cursor()
+        if not table_exists(cur, table) or not column_exists(cur, table, column):
+            return set()
+        return {
+            row[0]
+            for row in cur.execute(
+                f'select distinct "{column}" from "{table}" where "{column}" is not null and "{column}" != ""'
+            ).fetchall()
+            if isinstance(row[0], str)
+        }
+
+
+def state_rows_with_missing_rollout() -> int:
+    if not STATE_DB.exists():
+        return 0
+    with connect_state(write=False) as con:
+        cur = con.cursor()
+        if not table_exists(cur, "threads") or not column_exists(cur, "threads", "rollout_path"):
+            return 0
+        missing = 0
+        for (raw_path,) in cur.execute("select rollout_path from threads").fetchall():
+            if raw_path and not Path(raw_path).exists():
+                missing += 1
+        return missing
+
+
+def orphan_rollout_files(state_ids: set[str]) -> list[Path]:
+    if not SESSIONS_ROOT.exists():
+        return []
+    files: list[Path] = []
+    for path in SESSIONS_ROOT.rglob("rollout-*.jsonl"):
+        match = THREAD_ID_RE.search(path.name)
+        if match is None or match.group(0) not in state_ids:
+            files.append(path)
+    return files
+
+
+def protected_thread_ids(rows: list[ThreadRow]) -> set[str]:
+    protected = active_global_thread_ids()
+    cutoff = int(time.time()) - 10 * 60
+    for row in rows:
+        if row.updated_at and row.updated_at >= cutoff:
+            protected.add(row.thread_id)
+    return protected
+
+
+def inspect_orphans() -> dict[str, object]:
+    state_ids = fetch_thread_ids()
+    protected_ids = active_global_thread_ids()
+    logs_ids = thread_ids_from_db(LOGS_DB, "logs", "thread_id")
+    goals_ids = thread_ids_from_db(GOALS_DB, "thread_goals", "thread_id")
+    memory_ids = thread_ids_from_db(MEMORIES_DB, "stage1_outputs", "thread_id")
+    session_index_ids = read_session_index_ids()
+    global_ids = global_state_thread_ids()
+    orphan_ids = (
+        logs_ids
+        | goals_ids
+        | memory_ids
+        | session_index_ids
+        | global_ids
+    ) - state_ids - protected_ids
+    files = orphan_rollout_files(state_ids | protected_ids)
+    return {
+        "orphan_ids": orphan_ids,
+        "orphan_thread_ids": len(orphan_ids),
+        "orphan_logs": len(logs_ids - state_ids - protected_ids),
+        "orphan_goals": len(goals_ids - state_ids - protected_ids),
+        "orphan_memory_outputs": len(memory_ids - state_ids - protected_ids),
+        "orphan_session_index": len(session_index_ids - state_ids - protected_ids),
+        "orphan_global_state": len(global_ids - state_ids - protected_ids),
+        "orphan_rollout_files": len(files),
+        "orphan_rollout_paths": files,
+        "empty_session_dirs": count_empty_session_dirs(),
+        "broken_state_rollouts": state_rows_with_missing_rollout(),
+        "protected_thread_ids": len(protected_ids),
+    }
+
+
+def delete_thread_artifacts(target_ids: set[str], counts: dict[str, int]) -> None:
+    state_deletions = [
+        ("agent_job_items", "assigned_thread_id", "agent_job_items"),
+        ("stage1_outputs", "thread_id", "state_stage1_outputs"),
+        ("thread_dynamic_tools", "thread_id", "thread_dynamic_tools"),
+        ("thread_spawn_edges", "parent_thread_id", "thread_spawn_edges"),
+        ("thread_spawn_edges", "child_thread_id", "thread_spawn_edges"),
+        ("threads", "id", "threads"),
+    ]
+    for table, column, count_key in state_deletions:
+        delete_by_ids(STATE_DB, table, column, target_ids, counts, count_key)
+
+    delete_by_ids(LOGS_DB, "logs", "thread_id", target_ids, counts, "logs")
+    delete_by_ids(GOALS_DB, "thread_goals", "thread_id", target_ids, counts, "goals")
+    delete_by_ids(MEMORIES_DB, "stage1_outputs", "thread_id", target_ids, counts, "memory_outputs")
+
+    counts["session_index"] = counts.get("session_index", 0) + filter_session_index(target_ids)
+    counts["global_state"] = counts.get("global_state", 0) + clean_global_state(target_ids)
+
+
+def delete_orphan_artifacts() -> dict[str, int]:
+    report = inspect_orphans()
+    target_ids = set(report["orphan_ids"])
+    counts: dict[str, int] = {}
+    delete_thread_artifacts(target_ids, counts)
+    counts["orphan_rollout_files"] = delete_rollout_files(list(report["orphan_rollout_paths"]))
+    counts["empty_session_dirs"] = delete_empty_session_dirs()
+    counts["orphan_thread_ids"] = len(target_ids)
+    return counts
+
+
+def sqlite_reclaimable_bytes(db_path: Path) -> int:
+    if not db_path.exists():
+        return 0
+    try:
+        with connect_db(db_path, write=False) as con:
+            page_size = con.execute("pragma page_size").fetchone()[0] or 0
+            free_pages = con.execute("pragma freelist_count").fetchone()[0] or 0
+    except sqlite3.OperationalError:
+        return 0
+    return int(page_size) * int(free_pages)
+
+
+def should_compact_db(db_path: Path) -> bool:
+    if not db_path.exists():
+        return False
+    reclaimable = sqlite_reclaimable_bytes(db_path)
+    if reclaimable >= COMPACT_MIN_RECLAIM_BYTES:
+        return True
+    try:
+        size = db_path.stat().st_size
+    except OSError:
+        return False
+    if size <= 0:
+        return False
+    return reclaimable >= 5 * 1024 * 1024 and (reclaimable / size) >= COMPACT_MIN_RECLAIM_RATIO
+
+
+def compact_sqlite_databases(force: bool = True) -> dict[str, int]:
+    counts = {
+        "compacted_dbs": 0,
+        "compact_failed": 0,
+        "compact_skipped_dbs": 0,
+        "compact_reclaimable_bytes": 0,
+    }
+    seen: set[Path] = set()
+    for db_path in (STATE_DB, LOGS_DB, GOALS_DB, MEMORIES_DB):
+        if db_path in seen or not db_path.exists():
+            continue
+        seen.add(db_path)
+        reclaimable = sqlite_reclaimable_bytes(db_path)
+        counts["compact_reclaimable_bytes"] += reclaimable
+        if not force and not should_compact_db(db_path):
+            counts["compact_skipped_dbs"] += 1
+            continue
+        try:
+            with connect_db(db_path, write=True) as con:
+                con.execute("pragma wal_checkpoint(TRUNCATE)")
+                con.execute("vacuum")
+            counts["compacted_dbs"] += 1
+        except sqlite3.OperationalError:
+            counts["compact_failed"] += 1
+    return counts
+
+
+def compact_needed_databases() -> dict[str, int]:
+    return compact_sqlite_databases(force=False)
+
+
+def orphan_report_message(report: dict[str, object]) -> str:
+    return "\n".join(
+        [
+            f"남은 thread 흔적: {report.get('orphan_thread_ids', 0)}개",
+            f"남은 로그 흔적: {report.get('orphan_logs', 0)}개",
+            f"남은 goal 흔적: {report.get('orphan_goals', 0)}개",
+            f"남은 memory output 흔적: {report.get('orphan_memory_outputs', 0)}개",
+            f"남은 session index 흔적: {report.get('orphan_session_index', 0)}개",
+            f"남은 global state 흔적: {report.get('orphan_global_state', 0)}개",
+            f"남은 rollout 파일: {report.get('orphan_rollout_files', 0)}개",
+            f"빈 sessions 폴더: {report.get('empty_session_dirs', 0)}개",
+            f"rollout 파일이 없는 state 세션: {report.get('broken_state_rollouts', 0)}개",
+            f"보호 중인 활성 세션: {report.get('protected_thread_ids', 0)}개",
+        ]
+    )
+
+
+def remaining_junk_count(report: dict[str, object]) -> int:
+    return (
+        int(report.get("orphan_thread_ids", 0))
+        + int(report.get("orphan_rollout_files", 0))
+        + int(report.get("empty_session_dirs", 0))
+    )
+
+
+def add_counts(target: dict[str, int], source: dict[str, int]) -> None:
+    for key, value in source.items():
+        if isinstance(value, int):
+            target[key] = target.get(key, 0) + value
+
+
+def deletion_summary(counts: dict[str, int]) -> str:
+    lines = [
+        f"삭제한 채팅: {counts.get('threads', 0)}개",
+        f"삭제한 세션 파일: {counts.get('session_files', 0)}개",
+        f"삭제한 로그: {counts.get('logs', 0)}줄",
+        f"삭제한 goals: {counts.get('goals', 0)}개",
+        f"삭제한 memory outputs: {counts.get('memory_outputs', 0)}개",
+        f"삭제한 session index: {counts.get('session_index', 0)}개",
+        f"삭제한 global state 항목: {counts.get('global_state', 0)}개",
+        f"삭제한 빈 sessions 폴더: {counts.get('empty_session_dirs', 0)}개",
+        f"삭제한 빈 작업 폴더: {counts.get('empty_workspace_dirs', 0)}개",
+    ]
+    if counts.get("orphan_thread_ids", 0):
+        lines.insert(0, f"정리한 남은 thread 흔적: {counts.get('orphan_thread_ids', 0)}개")
+    if counts.get("orphan_rollout_files", 0):
+        lines.append(f"삭제한 남은 rollout 파일: {counts.get('orphan_rollout_files', 0)}개")
+    if counts.get("internal_reviews", 0):
+        lines.append(f"함께 삭제한 내부 검토 기록: {counts.get('internal_reviews', 0)}개")
+    if counts.get("nonempty_workspace_dirs", 0):
+        lines.append(f"파일이 있어 남긴 작업 폴더: {counts.get('nonempty_workspace_dirs', 0)}개")
+    if counts.get("skipped_tables", 0):
+        lines.append(f"없는 테이블 건너뜀: {counts.get('skipped_tables', 0)}개")
+    if counts.get("skipped_columns", 0):
+        lines.append(f"없는 컬럼 건너뜀: {counts.get('skipped_columns', 0)}개")
+    if counts.get("compact_reclaimable_bytes", 0):
+        lines.append(f"용량 줄이기 후보 공간: {fmt_size(counts.get('compact_reclaimable_bytes', 0))}")
+    if counts.get("compacted_dbs", 0):
+        lines.append(f"용량 줄이기 처리: {counts.get('compacted_dbs', 0)}개 DB")
+    elif counts.get("compact_skipped_dbs", 0):
+        lines.append("용량 줄이기: 필요할 만큼 큰 빈 공간이 없어 건너뜀")
+    if counts.get("compact_failed", 0):
+        lines.append("용량 줄이기: DB 사용 중이라 나중에 다시 시도 가능")
+    return "\n".join(lines)
+
+
 def delete_threads(rows: list[ThreadRow]) -> dict[str, int]:
     target_ids = {row.thread_id for row in rows}
     if not target_ids:
         return {}
 
-    placeholders = ",".join("?" for _ in target_ids)
-    params = tuple(target_ids)
     counts: dict[str, int] = {}
-
-    with connect_state(write=True) as con:
-        cur = con.cursor()
-        deletions = [
-            ("agent_job_items", f"assigned_thread_id in ({placeholders})"),
-            ("stage1_outputs", f"thread_id in ({placeholders})"),
-            ("thread_dynamic_tools", f"thread_id in ({placeholders})"),
-            ("thread_spawn_edges", f"parent_thread_id in ({placeholders})"),
-            ("thread_spawn_edges", f"child_thread_id in ({placeholders})"),
-            ("threads", f"id in ({placeholders})"),
-        ]
-        for table, where in deletions:
-            cur.execute(f"delete from {table} where {where}", params)
-            counts[table] = counts.get(table, 0) + cur.rowcount
-        con.commit()
-
-    counts["session_index"] = filter_session_index(target_ids)
-    counts["global_state"] = clean_global_state(target_ids)
+    delete_thread_artifacts(target_ids, counts)
     counts.update(delete_empty_workspace_dirs(rows))
+    counts["session_files"] = delete_rollout_files([row.rollout_path for row in rows])
+    counts["empty_session_dirs"] = counts.get("empty_session_dirs", 0) + delete_empty_session_dirs()
+    return counts
 
-    deleted_files = 0
-    for row in rows:
-        if row.rollout_path.exists():
-            safe_path = ensure_under(row.rollout_path, SESSIONS_ROOT)
-            if not safe_path.name.startswith("rollout-"):
-                raise RuntimeError(f"Unexpected session filename:\n{safe_path}")
-            safe_path.unlink()
-            deleted_files += 1
-    counts["session_files"] = deleted_files
+
+def smart_cleanup_artifacts(rows_to_delete: list[ThreadRow], internal_reviews: int = 0) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    if rows_to_delete:
+        add_counts(counts, delete_threads(rows_to_delete))
+        if internal_reviews:
+            counts["internal_reviews"] = internal_reviews
+    add_counts(counts, delete_orphan_artifacts())
+    add_counts(counts, compact_needed_databases())
     return counts
 
 
@@ -384,6 +825,7 @@ class App(tk.Tk):
         self.view_mode = "sessions"
         self.image_columns = IMAGE_MIN_COLUMNS
         self.large_preview_window: tk.Toplevel | None = None
+        self.last_orphan_report: dict[str, object] | None = None
 
         self._build_ui()
         self.refresh()
@@ -489,12 +931,16 @@ class App(tk.Tk):
         bottom = tk.Frame(main, bg=COLORS["bg"])
         bottom.grid(row=3, column=0, sticky="ew", padx=18, pady=(10, 14))
         bottom.columnconfigure(0, weight=1)
+        self.orphan_scan_button = self._button(bottom, "남은 찌꺼기 확인", self.scan_orphans)
+        self.orphan_scan_button.grid(row=0, column=1, padx=(0, 6))
+        self.compact_button = self._button(bottom, "용량 줄이기", self.compact_databases)
+        self.compact_button.grid(row=0, column=2, padx=(0, 10))
         self.check_all_button = self._button(bottom, "보이는 항목 모두 체크", self.check_visible)
-        self.check_all_button.grid(row=0, column=1, padx=6)
+        self.check_all_button.grid(row=0, column=3, padx=6)
         self.clear_button = self._button(bottom, "체크 해제", self.clear_checks)
-        self.clear_button.grid(row=0, column=2, padx=(0, 6))
-        self.delete_button = self._button(bottom, "체크한 항목 삭제", self.delete_checked, danger=True)
-        self.delete_button.grid(row=0, column=3)
+        self.clear_button.grid(row=0, column=4, padx=(0, 6))
+        self.delete_button = self._button(bottom, "스마트 정리", self.delete_checked, danger=True)
+        self.delete_button.grid(row=0, column=5)
 
     def _sidebar_line(
         self, parent: tk.Frame, label: str, value: str, row: int
@@ -604,6 +1050,8 @@ class App(tk.Tk):
             self.sidebar_total_label.configure(text="전체 이미지")
             self.sidebar_visible_label.configure(text="표시 중")
             self.sidebar_checked_label.configure(text="체크됨")
+            self.orphan_scan_button.configure(state="disabled")
+            self.compact_button.configure(state="disabled")
             self.check_all_button.configure(text="보이는 이미지 모두 체크")
             self.delete_button.configure(text="선택 이미지 삭제")
             self.render_header(["이미지 미리보기"])
@@ -611,8 +1059,10 @@ class App(tk.Tk):
             self.sidebar_total_label.configure(text="전체 세션")
             self.sidebar_visible_label.configure(text="표시 중")
             self.sidebar_checked_label.configure(text="체크됨")
+            self.orphan_scan_button.configure(state="normal")
+            self.compact_button.configure(state="normal")
             self.check_all_button.configure(text="보이는 항목 모두 체크")
-            self.delete_button.configure(text="체크한 항목 삭제")
+            self.delete_button.configure(text="스마트 정리")
             self.render_header(["", "수정일", "제목", "출처", "모델", "폴더"])
 
     def _resize_list(self, event: tk.Event) -> None:
@@ -658,7 +1108,7 @@ class App(tk.Tk):
             try:
                 self.rows = fetch_threads()
                 existing_ids = {row.thread_id for row in self.rows}
-                self.checked_ids &= existing_ids
+                self.checked_ids &= existing_ids - protected_thread_ids(self.rows)
             except Exception as exc:
                 messagebox.showerror("불러오기 실패", str(exc))
                 self.rows = []
@@ -695,12 +1145,16 @@ class App(tk.Tk):
             self.update_status()
             return
 
+        protected_ids = protected_thread_ids(self.rows)
         for idx, row in enumerate(self.visible_rows):
+            is_protected = row.thread_id in protected_ids
             item = tk.Frame(self.list_frame, bg=COLORS["row"], bd=0, highlightthickness=1)
             item.configure(highlightbackground=COLORS["border"], highlightcolor=COLORS["border"])
             item.grid(row=idx, column=0, sticky="ew", pady=(0, 5))
             self._configure_row_grid(item)
             title = row.title.replace("\r", " ").replace("\n", " ")[:120]
+            if is_protected:
+                title = f"{title} [보호]"
 
             var = tk.BooleanVar(value=row.thread_id in self.checked_ids)
             self.check_vars[row.thread_id] = var
@@ -718,6 +1172,8 @@ class App(tk.Tk):
                 bd=0,
                 cursor="hand2",
             )
+            if is_protected:
+                check.configure(state="disabled")
             check.grid(row=0, column=0, sticky="w", padx=(8, 0), pady=7)
 
             tk.Label(
@@ -732,7 +1188,7 @@ class App(tk.Tk):
                 item,
                 text=title,
                 bg=COLORS["row"],
-                fg=COLORS["text"],
+                fg=COLORS["accent"] if is_protected else COLORS["text"],
                 font=FONT,
                 anchor="w",
             )
@@ -763,10 +1219,11 @@ class App(tk.Tk):
                 open_button.configure(state="disabled")
 
             for widget in (item, title_label):
-                widget.bind(
-                    "<Button-1>",
-                    lambda _event, thread_id=row.thread_id: self.toggle_checked(thread_id),
-                )
+                if not is_protected:
+                    widget.bind(
+                        "<Button-1>",
+                        lambda _event, thread_id=row.thread_id: self.toggle_checked(thread_id),
+                    )
                 widget.bind(
                     "<Enter>",
                     lambda _event, row_frame=item: self._set_row_bg(row_frame, COLORS["row_hover"]),
@@ -821,6 +1278,8 @@ class App(tk.Tk):
         self.sidebar_checked.configure(text=str(len(self.checked_ids)))
 
     def set_checked(self, thread_id: str, checked: bool) -> None:
+        if checked and thread_id in protected_thread_ids(self.rows):
+            return
         if checked:
             self.checked_ids.add(thread_id)
         else:
@@ -840,8 +1299,10 @@ class App(tk.Tk):
                 self.checked_image_paths.add(self.image_key(image))
             self.apply_filter()
             return
+        protected_ids = protected_thread_ids(self.rows)
         for row in self.visible_rows:
-            self.checked_ids.add(row.thread_id)
+            if row.thread_id not in protected_ids:
+                self.checked_ids.add(row.thread_id)
         self.apply_filter()
 
     def clear_checks(self) -> None:
@@ -851,6 +1312,71 @@ class App(tk.Tk):
             return
         self.checked_ids.clear()
         self.apply_filter()
+
+    def scan_orphans(self) -> None:
+        try:
+            self.last_orphan_report = inspect_orphans()
+        except Exception as exc:
+            messagebox.showerror("남은 찌꺼기 확인 실패", str(exc))
+            return
+        messagebox.showinfo("남은 찌꺼기 확인", orphan_report_message(self.last_orphan_report))
+
+    def delete_orphans(self) -> None:
+        try:
+            report = inspect_orphans()
+        except Exception as exc:
+            messagebox.showerror("남은 찌꺼기 확인 실패", str(exc))
+            return
+        self.last_orphan_report = report
+        target_ids = set(report["orphan_ids"])
+        if (
+            not target_ids
+            and not report.get("orphan_rollout_files", 0)
+            and not report.get("empty_session_dirs", 0)
+        ):
+            messagebox.showinfo("남은 찌꺼기 없음", "삭제할 남은 찌꺼기가 없습니다.")
+            return
+        if not self.ask_centered(
+            "남은 찌꺼기 삭제 확인",
+            (
+                f"{orphan_report_message(report)}\n\n"
+                "state DB의 threads에 없는 기록만 정리합니다.\n"
+                "현재 활성 세션으로 보이는 항목은 보호합니다."
+            ),
+        ):
+            return
+        try:
+            counts = delete_orphan_artifacts()
+        except sqlite3.OperationalError as exc:
+            messagebox.showerror("남은 찌꺼기 삭제 실패", f"{exc}\n\nCodex 앱을 닫고 다시 시도해보세요.")
+            return
+        except Exception as exc:
+            messagebox.showerror("남은 찌꺼기 삭제 실패", str(exc))
+            return
+        messagebox.showinfo("남은 찌꺼기 삭제 완료", deletion_summary(counts))
+        self.refresh()
+
+    def compact_databases(self) -> None:
+        if not self.ask_centered(
+            "용량 줄이기 확인",
+            (
+                "삭제 후 DB 파일 안에 남은 빈 공간을 정리합니다.\n\n"
+                "Codex 앱이 DB를 사용 중이면 실패할 수 있습니다.\n"
+                "실패하면 Codex 앱을 닫고 다시 시도하세요."
+            ),
+            confirm_text="용량 줄이기",
+        ):
+            return
+        counts = compact_sqlite_databases(force=True)
+        messagebox.showinfo(
+            "용량 줄이기 완료",
+            "\n".join(
+                [
+                    f"처리한 DB: {counts.get('compacted_dbs', 0)}개",
+                    f"잠금 등으로 실패한 DB: {counts.get('compact_failed', 0)}개",
+                ]
+            ),
+        )
 
     def image_key(self, image: GeneratedImage) -> str:
         return str(image.path.resolve()).lower()
@@ -1158,7 +1684,12 @@ class App(tk.Tk):
 
     def checked_rows(self) -> list[ThreadRow]:
         by_id = {row.thread_id: row for row in self.rows}
-        return [by_id[thread_id] for thread_id in self.checked_ids if thread_id in by_id]
+        protected_ids = protected_thread_ids(self.rows)
+        return [
+            by_id[thread_id]
+            for thread_id in self.checked_ids
+            if thread_id in by_id and thread_id not in protected_ids
+        ]
 
     def related_internal_reviews(self, rows: list[ThreadRow]) -> list[ThreadRow]:
         target_ids = {row.thread_id for row in rows}
@@ -1177,45 +1708,58 @@ class App(tk.Tk):
             return
 
         rows = self.checked_rows()
-        if not rows:
-            messagebox.showinfo("체크 없음", "삭제할 채팅을 먼저 체크하세요.")
+        related_rows = self.related_internal_reviews(rows) if rows else []
+        protected_ids = protected_thread_ids(self.rows)
+        rows_to_delete = [row for row in rows + related_rows if row.thread_id not in protected_ids]
+
+        try:
+            report = inspect_orphans()
+        except Exception as exc:
+            messagebox.showerror("스마트 정리 실패", str(exc))
             return
 
-        related_rows = self.related_internal_reviews(rows)
-        rows_to_delete = rows + related_rows
+        junk_count = remaining_junk_count(report)
+        if not rows_to_delete and not junk_count:
+            messagebox.showinfo(
+                "정리할 항목 없음",
+                "삭제할 체크 세션이나 남은 찌꺼기가 없습니다.\n\n보호 세션은 그대로 둡니다.",
+            )
+            return
 
-        preview = "\n".join(f"- {row.title[:80]}" for row in rows[:8])
-        if len(rows) > 8:
-            preview += f"\n- ... 외 {len(rows) - 8}개"
+        preview = "\n".join(f"- {row.title[:80]}" for row in rows_to_delete[:8])
+        if len(rows_to_delete) > 8:
+            preview += f"\n- ... 외 {len(rows_to_delete) - 8}개"
         related_msg = ""
         if related_rows:
             related_msg = f"\n\n관련 내부 검토 기록 {len(related_rows)}개도 함께 삭제합니다."
+        checked_msg = f"\n\n{preview}{related_msg}" if preview else ""
         if not self.ask_centered(
-            "삭제 확인",
-            f"체크한 채팅 {len(rows)}개를 삭제할까요?\n\n{preview}{related_msg}\n\n최근 목록 DB와 실제 세션 파일을 함께 삭제합니다.",
+            "스마트 정리 확인",
+            (
+                f"삭제할 체크 세션: {len(rows_to_delete)}개\n"
+                f"정리할 남은 찌꺼기: {junk_count}개\n"
+                f"보호된 현재/최근 세션: {report.get('protected_thread_ids', 0)}개"
+                f"{checked_msg}\n\n"
+                "체크하지 않은 정상 세션은 삭제하지 않습니다.\n"
+                "보호 세션은 삭제하지 않습니다."
+            ),
+            confirm_text="정리",
         ):
             return
 
         try:
-            counts = delete_threads(rows_to_delete)
+            deleted_ids = {row.thread_id for row in rows_to_delete}
+            internal_review_count = sum(1 for row in related_rows if row.thread_id in deleted_ids)
+            counts = smart_cleanup_artifacts(rows_to_delete, internal_reviews=internal_review_count)
+            self.checked_ids.difference_update(row.thread_id for row in rows_to_delete)
         except sqlite3.OperationalError as exc:
-            messagebox.showerror("삭제 실패", f"{exc}\n\nCodex 앱을 닫고 다시 시도해보세요.")
+            messagebox.showerror("스마트 정리 실패", f"{exc}\n\nCodex 앱을 닫고 다시 시도해보세요.")
             return
         except Exception as exc:
-            messagebox.showerror("삭제 실패", str(exc))
+            messagebox.showerror("스마트 정리 실패", str(exc))
             return
 
-        self.checked_ids.difference_update(row.thread_id for row in rows_to_delete)
-        msg = [
-            f"삭제한 채팅: {counts.get('threads', 0)}개",
-            f"삭제한 파일: {counts.get('session_files', 0)}개",
-            f"삭제한 빈 작업 폴더: {counts.get('empty_workspace_dirs', 0)}개",
-        ]
-        if counts.get("nonempty_workspace_dirs", 0):
-            msg.append(f"파일이 있어 남긴 작업 폴더: {counts.get('nonempty_workspace_dirs', 0)}개")
-        if related_rows:
-            msg.append(f"함께 삭제한 내부 검토 기록: {len(related_rows)}개")
-        messagebox.showinfo("삭제 완료", "\n".join(msg))
+        messagebox.showinfo("스마트 정리 완료", deletion_summary(counts))
         self.refresh()
 
 
