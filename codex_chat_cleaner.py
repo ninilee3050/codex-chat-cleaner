@@ -7,7 +7,7 @@ import sqlite3
 import time
 import tkinter as tk
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import messagebox, ttk
 
@@ -86,6 +86,13 @@ class ThreadRow:
     archived: int
     rollout_path: Path
     cwd: Path | None
+
+
+@dataclass(frozen=True)
+class SessionIndexEntry:
+    thread_id: str
+    title: str
+    updated_at: int
 
 
 @dataclass(frozen=True)
@@ -185,13 +192,161 @@ def fetch_thread_ids() -> set[str]:
         return {row[0] for row in cur.execute("select id from threads").fetchall()}
 
 
-def fetch_threads() -> list[ThreadRow]:
+def parse_iso_timestamp(value: str) -> int:
+    if not value:
+        return 0
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    match = re.match(r"(.+\.)(\d{6})\d+([+-]\d\d:\d\d)$", text)
+    if match:
+        text = "".join(match.groups())
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return 0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp())
+
+
+def read_session_index_entries() -> list[SessionIndexEntry]:
+    if not SESSION_INDEX.exists():
+        return []
+    entries: list[SessionIndexEntry] = []
+    for line in SESSION_INDEX.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        thread_id = item.get("id")
+        if not isinstance(thread_id, str) or not THREAD_ID_RE.fullmatch(thread_id):
+            continue
+        title = item.get("thread_name") or item.get("title") or ""
+        updated_at = parse_iso_timestamp(item.get("updated_at") or "")
+        entries.append(
+            SessionIndexEntry(
+                thread_id=thread_id,
+                title=title if isinstance(title, str) else "",
+                updated_at=updated_at,
+            )
+        )
+    return entries
+
+
+def rollout_files_by_thread_id() -> dict[str, Path]:
+    if not SESSIONS_ROOT.exists():
+        return {}
+    files: dict[str, Path] = {}
+    for path in SESSIONS_ROOT.rglob("rollout-*.jsonl"):
+        match = THREAD_ID_RE.search(path.name)
+        if match is None:
+            continue
+        thread_id = match.group(0)
+        previous = files.get(thread_id)
+        if previous is None or path.stat().st_mtime > previous.stat().st_mtime:
+            files[thread_id] = path
+    return files
+
+
+def read_rollout_summary(path: Path) -> dict[str, object]:
+    summary: dict[str, object] = {
+        "cwd": None,
+        "source": "",
+        "provider": "",
+        "first_user_message": "",
+        "timestamp": 0,
+    }
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return summary
+
+    for line in lines[:300]:
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        payload = item.get("payload")
+        if not isinstance(payload, dict):
+            continue
+
+        if item.get("type") == "session_meta":
+            cwd = payload.get("cwd")
+            if isinstance(cwd, str):
+                summary["cwd"] = parse_windows_path(cwd)
+            source = payload.get("source")
+            if isinstance(source, str):
+                summary["source"] = source
+            provider = payload.get("model_provider")
+            if isinstance(provider, str):
+                summary["provider"] = provider
+            timestamp = payload.get("timestamp")
+            if isinstance(timestamp, str):
+                summary["timestamp"] = parse_iso_timestamp(timestamp)
+
+        if not summary["first_user_message"]:
+            message = rollout_user_message(item, payload)
+            if message and not message.startswith("<environment_context>"):
+                summary["first_user_message"] = message
+
+        if summary["cwd"] is not None and summary["first_user_message"]:
+            break
+
+    if not summary["timestamp"]:
+        try:
+            summary["timestamp"] = int(path.stat().st_mtime)
+        except OSError:
+            pass
+    return summary
+
+
+def rollout_user_message(item: dict, payload: dict) -> str:
+    if item.get("type") == "event_msg" and payload.get("type") == "user_message":
+        message = payload.get("message")
+        return message if isinstance(message, str) else ""
+
+    if item.get("type") != "response_item":
+        return ""
+    if payload.get("type") != "message" or payload.get("role") != "user":
+        return ""
+    content = payload.get("content")
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for part in content:
+        if isinstance(part, dict) and part.get("type") == "input_text":
+            text = part.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "\n".join(parts).strip()
+
+
+def thread_row_from_rollout(entry: SessionIndexEntry, path: Path) -> ThreadRow:
+    summary = read_rollout_summary(path)
+    first_user_message = str(summary.get("first_user_message") or "")
+    title = entry.title or first_user_message.splitlines()[0][:80]
+    updated_at = entry.updated_at or int(summary.get("timestamp") or 0)
+    return ThreadRow(
+        thread_id=entry.thread_id,
+        title=title,
+        first_user_message=first_user_message,
+        updated_at=updated_at,
+        source=str(summary.get("source") or "unknown"),
+        provider=str(summary.get("provider") or "openai"),
+        archived=0,
+        rollout_path=path,
+        cwd=summary.get("cwd") if isinstance(summary.get("cwd"), Path) else None,
+    )
+
+
+def fetch_state_threads() -> list[ThreadRow]:
     if not STATE_DB.exists():
-        raise FileNotFoundError(f"State DB not found:\n{STATE_DB}")
+        return []
     with connect_state(write=False) as con:
         cur = con.cursor()
         if not table_exists(cur, "threads"):
-            raise RuntimeError(f"threads table not found:\n{STATE_DB}")
+            return []
         rows = cur.execute(
             """
             select id, title, first_user_message, updated_at, source, model_provider, archived, rollout_path, cwd
@@ -213,6 +368,22 @@ def fetch_threads() -> list[ThreadRow]:
         )
         for row in rows
     ]
+
+
+def fetch_threads() -> list[ThreadRow]:
+    rows = fetch_state_threads()
+    by_id = {row.thread_id: row for row in rows}
+    rollout_files = rollout_files_by_thread_id()
+
+    for entry in read_session_index_entries():
+        if entry.thread_id in by_id:
+            continue
+        rollout_path = rollout_files.get(entry.thread_id)
+        if rollout_path is None:
+            continue
+        by_id[entry.thread_id] = thread_row_from_rollout(entry, rollout_path)
+
+    return sorted(by_id.values(), key=lambda row: row.updated_at, reverse=True)
 
 
 def fetch_generated_images() -> list[GeneratedImage]:
@@ -334,18 +505,16 @@ def is_related_internal_review(row: ThreadRow, target_ids: set[str]) -> bool:
 
 
 def read_session_index_ids() -> set[str]:
-    if not SESSION_INDEX.exists():
-        return set()
-    ids: set[str] = set()
-    for line in SESSION_INDEX.read_text(encoding="utf-8", errors="replace").splitlines():
-        try:
-            item = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        thread_id = item.get("id")
-        if isinstance(thread_id, str):
-            ids.add(thread_id)
-    return ids
+    return {entry.thread_id for entry in read_session_index_entries()}
+
+
+def indexed_thread_ids_with_rollouts() -> set[str]:
+    rollout_files = rollout_files_by_thread_id()
+    return {
+        entry.thread_id
+        for entry in read_session_index_entries()
+        if entry.thread_id in rollout_files
+    }
 
 
 def filter_session_index(target_ids: set[str]) -> int:
@@ -641,6 +810,8 @@ def protected_thread_ids(rows: list[ThreadRow]) -> set[str]:
 
 def inspect_orphans() -> dict[str, object]:
     state_ids = fetch_thread_ids()
+    indexed_ids = indexed_thread_ids_with_rollouts()
+    known_ids = state_ids | indexed_ids
     protected_ids = active_global_thread_ids() | read_manual_protected_thread_ids()
     logs_ids = thread_ids_from_db(LOGS_DB, "logs", "thread_id")
     goals_ids = thread_ids_from_db(GOALS_DB, "thread_goals", "thread_id")
@@ -653,16 +824,16 @@ def inspect_orphans() -> dict[str, object]:
         | memory_ids
         | session_index_ids
         | global_ids
-    ) - state_ids - protected_ids
-    files = orphan_rollout_files(state_ids | protected_ids)
+    ) - known_ids - protected_ids
+    files = orphan_rollout_files(known_ids | protected_ids)
     return {
         "orphan_ids": orphan_ids,
         "orphan_thread_ids": len(orphan_ids),
-        "orphan_logs": len(logs_ids - state_ids - protected_ids),
-        "orphan_goals": len(goals_ids - state_ids - protected_ids),
-        "orphan_memory_outputs": len(memory_ids - state_ids - protected_ids),
-        "orphan_session_index": len(session_index_ids - state_ids - protected_ids),
-        "orphan_global_state": len(global_ids - state_ids - protected_ids),
+        "orphan_logs": len(logs_ids - known_ids - protected_ids),
+        "orphan_goals": len(goals_ids - known_ids - protected_ids),
+        "orphan_memory_outputs": len(memory_ids - known_ids - protected_ids),
+        "orphan_session_index": len(session_index_ids - known_ids - protected_ids),
+        "orphan_global_state": len(global_ids - known_ids - protected_ids),
         "orphan_rollout_files": len(files),
         "orphan_rollout_paths": files,
         "empty_session_dirs": count_empty_session_dirs(),

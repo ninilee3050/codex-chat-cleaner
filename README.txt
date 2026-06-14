@@ -14,6 +14,7 @@
 
 목록:
 - 일반 채팅 세션만 표시하고 검색합니다.
+- Codex의 state DB, session_index.jsonl, sessions 폴더의 rollout 파일을 합쳐서 세션 목록을 찾습니다.
 - "The following is..."로 시작하는 내부 검토 기록은 목록에서 숨깁니다.
 - 출처가 guardian으로 표시되는 내부 검토 기록도 목록에서 숨깁니다.
 - 수정일 기준 최신순으로 정렬됩니다.
@@ -57,7 +58,8 @@
 - 용량 줄이기가 실패해도 삭제 정리는 완료된 것으로 봅니다. 나중에 Codex를 닫고 다시 시도할 수 있습니다.
 
 남은 찌꺼기 정리:
-- state DB의 threads에는 없지만 logs/goals/memories/session_index/global_state에 남은 thread id를 남은 찌꺼기로 봅니다.
+- state DB와 session_index/rollout 파일로 확인되는 정상 세션은 남은 찌꺼기로 보지 않습니다.
+- 정상 세션 목록에는 없지만 logs/goals/memories/session_index/global_state에 남은 thread id를 남은 찌꺼기로 봅니다.
 - "남은 찌꺼기 확인"은 삭제하지 않고 남은 수량만 보여줍니다.
 - "스마트 정리"는 확인창을 보여준 뒤 남은 찌꺼기를 함께 삭제합니다.
 - 최근 활성 세션 또는 전역 상태에서 현재 projectless 세션으로 보이는 thread id는 기본 보호합니다.
